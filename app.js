@@ -399,7 +399,7 @@ const QUERIES = {
   NODE_INFO_KSM: 'kube_node_info',
   NODE_MEMORY_USAGE: '(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100',
   NODE_MEMORY_TOTAL: 'sum by (node) (kube_node_status_allocatable{resource="memory"})',
-  NODE_DISK_USAGE: 'max by (instance) ((node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay"} - node_filesystem_avail_bytes{fstype=~"ext.?|xfs|overlay"}) / node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay"} * 100)',
+  NODE_DISK_USAGE: 'max by (instance) ((node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay|tmpfs",mountpoint!~"/var/lib/kubelet.*"} - node_filesystem_avail_bytes{fstype=~"ext.?|xfs|overlay|tmpfs",mountpoint!~"/var/lib/kubelet.*"}) / node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay|tmpfs",mountpoint!~"/var/lib/kubelet.*"} * 100)',
   NODE_DISK_TOTAL: 'sum by (node) (kube_node_status_allocatable{resource="ephemeral_storage"})',
   NODE_CPU_USAGE: '(1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100',
   NODE_CPU_TOTAL: 'sum by (node) (kube_node_status_allocatable{resource="cpu"})',
