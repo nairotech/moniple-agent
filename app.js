@@ -1,350 +1,502 @@
-const { response } = require('express');
-const express = require('express')
+const express = require('express');
 const cors = require('cors');
-const app = express()
-const port = 3000
 require('dotenv').config();
 
+const app = express();
+const port = process.env.PORT || 3000;
+
+// CORS
 app.use(cors({
-    origin: '*', // Tüm kaynaklara izin ver
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // İzin verilen yöntemler
-    allowedHeaders: ['*', '*'] // İzin verilen başlıklar
-  }));
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['*']
+}));
 
-// pipe fix 7
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
 
-const units = ['bytes', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
-   
-function getByteUnit(x){
+const CONFIG = {
+  apiUrl: process.env.PROMETHEUS_API_URL || 'http://prometheus:9090/api/v1',
+  apiUser: process.env.PROMETHEUS_API_USER || '',
+  apiPassword: process.env.PROMETHEUS_API_PASSWORD || '',
+  threshold: parseInt(process.env.DEFAULT_THRESHOLD) || 80
+};
 
-  let l = 0, n = parseInt(x, 10) || 0;
+// ============================================================================
+// EMBEDDED PROMQL QUERIES (Compatible with both Prometheus & Victoria Metrics)
+// ============================================================================
 
-  while(n >= 1024 && ++l){
-      n = n/1024;
+const QUERIES = {
+  // Namespace (kube-state-metrics v2 uses exported_namespace label)
+  NS: 'kube_namespace_status_phase{phase="Active"}',
+
+  // PVC - try kubelet stats first, fallback to kube-state-metrics
+  PVC_USAGE: 'sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes * 100)',
+  PVC_TOTAL: 'sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes)',
+  // Fallback PVC queries using kube-state-metrics
+  PVC_INFO: 'kube_persistentvolumeclaim_info',
+  PVC_CAPACITY: 'sum by (namespace,persistentvolumeclaim) (kube_persistentvolumeclaim_resource_requests_storage_bytes)',
+
+  // Pod
+  POD_STATUS: 'sum by(exported_namespace,pod,phase) (kube_pod_status_phase > 0)',
+  POD_CPU_USAGE: 'sum by (pod,namespace) (rate(container_cpu_usage_seconds_total{pod!=""}[5m]))',
+  POD_MEMORY_USAGE: 'sum by (pod,namespace) (container_memory_working_set_bytes{pod!=""})',
+
+  // Node (use node_uname_info for correct instance, fallback to kube_node_info)
+  NODE_INFO: 'node_uname_info or kube_node_info',
+  NODE_INFO_EXPORTER: 'node_uname_info',
+  NODE_INFO_KSM: 'kube_node_info',
+  NODE_MEMORY_USAGE: '(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100',
+  NODE_MEMORY_TOTAL: 'sum by (node) (kube_node_status_allocatable{resource="memory"})',
+  NODE_DISK_USAGE: 'max by (instance) ((node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay"} - node_filesystem_avail_bytes{fstype=~"ext.?|xfs|overlay"}) / node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay"} * 100)',
+  NODE_DISK_TOTAL: 'sum by (node) (kube_node_status_allocatable{resource="ephemeral_storage"})',
+  NODE_CPU_USAGE: '(1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100',
+  NODE_CPU_TOTAL: 'sum by (node) (kube_node_status_allocatable{resource="cpu"})',
+  NODE_POD_USAGE: 'count by (node) (kube_pod_info) / sum by (node) (kube_node_status_allocatable{resource="pods"}) * 100',
+  NODE_POD_TOTAL: 'sum by (node) (kube_node_status_allocatable{resource="pods"})'
+};
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+const UNITS = ['bytes', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+
+function formatBytes(bytes) {
+  if (!bytes || bytes === 0) return { value: 0, unit: 'bytes' };
+  let value = parseFloat(bytes);
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < UNITS.length - 1) {
+    value /= 1024;
+    unitIndex++;
   }
-  
-  return(units[l]);
+  return {
+    value: Math.round(value * 10) / 10,
+    unit: UNITS[unitIndex]
+  };
 }
 
-function niceBytes(x){
+function round(num, decimals = 0) {
+  if (num === null || num === undefined || isNaN(num)) return 0;
+  const factor = Math.pow(10, decimals);
+  return Math.round(parseFloat(num) * factor) / factor;
+}
 
-  let l = 0, n = parseInt(x, 10) || 0;
+function getTimestamp() {
+  return Math.floor(Date.now() / 1000);
+}
 
-  while(n >= 1024 && ++l){
-      n = n/1024;
+// ============================================================================
+// PROMETHEUS/VICTORIAMETRICS API CLIENT
+// ============================================================================
+
+async function queryPrometheus(query) {
+  const url = `${CONFIG.apiUrl}/query?query=${encodeURIComponent(query)}`;
+  const options = {};
+
+  if (CONFIG.apiUser && CONFIG.apiPassword) {
+    const auth = Buffer.from(`${CONFIG.apiUser}:${CONFIG.apiPassword}`).toString('base64');
+    options.headers = { 'Authorization': `Basic ${auth}` };
   }
-  
-  return(n.toFixed(n < 10 && l > 0 ? 1 : 0));
+
+  try {
+    const response = await fetch(url, options);
+    const data = await response.json();
+
+    if (data.status === 'success') {
+      return data.data.result || [];
+    }
+    console.error('Query failed:', query, data.error);
+    return [];
+  } catch (error) {
+    console.error('Fetch error:', error.message);
+    return [];
+  }
 }
 
-if(process.env.PROMETHEUS_API_USER && process.env.PROMETHEUS_API_PASSWORD){
-    var basicauth=Buffer.from("${process.env.PROMETHEUS_API_USER}:${process.env.PROMETHEUS_API_PASSWORD}").toString('base64')
-app.use(function(req, res, next) {
-    res.header("Authorization", "Basic $basicauth");
-    next();
-  });
+async function fetchAlerts() {
+  const url = `${CONFIG.apiUrl}/alerts`;
+  const options = {};
+
+  if (CONFIG.apiUser && CONFIG.apiPassword) {
+    const auth = Buffer.from(`${CONFIG.apiUser}:${CONFIG.apiPassword}`).toString('base64');
+    options.headers = { 'Authorization': `Basic ${auth}` };
+  }
+
+  try {
+    const response = await fetch(url, options);
+    const data = await response.json();
+    return data.status === 'success' ? data.data.alerts || [] : [];
+  } catch (error) {
+    console.error('Alerts fetch error:', error.message);
+    return [];
+  }
 }
 
+// ============================================================================
+// ENDPOINTS
+// ============================================================================
+
+// Health check
 app.get('/health', (req, res) => {
-    return res.json({ success: true });
-})
+  res.json({ ok: true, timestamp: getTimestamp() });
+});
 
-app.get('/metrics/ns', (req, res) => {
-    fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NS))
-    .then((response) => response.json())
-    .then((body) => {
-        console.log(body)
-        if (body.status) {
-            myresult={data:[]}
-            myresult.key = "NS"
-            body.data.result.forEach((item,i)=>{
-                myresult.data[i]=item.metric.namespace
-            })
-            res.json(myresult);
+// -----------------------------------------------------------------------------
+// GET /metrics/ns - Namespace listesi
+// -----------------------------------------------------------------------------
+app.get('/metrics/ns', async (req, res) => {
+  try {
+    const result = await queryPrometheus(QUERIES.NS);
+    // kube-state-metrics v2 uses exported_namespace, v1 uses namespace
+    const namespaces = result.map(item =>
+      item.metric.exported_namespace || item.metric.namespace
+    ).filter(Boolean);
+
+    res.json({
+      ok: true,
+      timestamp: getTimestamp(),
+      count: namespaces.length,
+      namespaces: [...new Set(namespaces)].sort()
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// GET /metrics/pod - Pod durumları ve resource kullanımı
+// -----------------------------------------------------------------------------
+app.get('/metrics/pod', async (req, res) => {
+  try {
+    const [statusData, cpuData, memoryData] = await Promise.all([
+      queryPrometheus(QUERIES.POD_STATUS),
+      queryPrometheus(QUERIES.POD_CPU_USAGE),
+      queryPrometheus(QUERIES.POD_MEMORY_USAGE)
+    ]);
+
+    const pods = statusData.map(item => {
+      // kube-state-metrics uses exported_namespace for namespace, but pod for pod name
+      const namespace = item.metric.exported_namespace || item.metric.namespace;
+      const podName = item.metric.pod;
+
+      // CPU (cAdvisor uses namespace/pod labels - match by pod name since namespace might differ)
+      const cpuItem = cpuData.find(c => c.metric.pod === podName && c.metric.namespace === namespace);
+      const cpuCores = cpuItem ? round(parseFloat(cpuItem.value[1]), 3) : 0;
+
+      // Memory
+      const memItem = memoryData.find(m => m.metric.pod === podName && m.metric.namespace === namespace);
+      const memory = memItem ? formatBytes(memItem.value[1]) : { value: 0, unit: 'bytes' };
+
+      return {
+        namespace,
+        name: podName,
+        phase: item.metric.phase,
+        cpu: { value: cpuCores, unit: 'cores' },
+        memory: { value: memory.value, unit: memory.unit }
+      };
+    });
+
+    // Summary
+    const summary = {
+      total: pods.length,
+      running: pods.filter(p => p.phase === 'Running').length,
+      pending: pods.filter(p => p.phase === 'Pending').length,
+      failed: pods.filter(p => p.phase === 'Failed').length
+    };
+
+    res.json({
+      ok: true,
+      timestamp: getTimestamp(),
+      summary,
+      pods
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// GET /metrics/pvc - PersistentVolumeClaim durumları
+// -----------------------------------------------------------------------------
+app.get('/metrics/pvc', async (req, res) => {
+  try {
+    // Try kubelet_volume_stats first (provides actual usage)
+    let [totalData, usageData] = await Promise.all([
+      queryPrometheus(QUERIES.PVC_TOTAL),
+      queryPrometheus(QUERIES.PVC_USAGE)
+    ]);
+
+    // Fallback to kube-state-metrics if kubelet_volume_stats not available
+    if (totalData.length === 0) {
+      totalData = await queryPrometheus(QUERIES.PVC_CAPACITY);
+    }
+
+    const pvcs = totalData.map(item => {
+      // Handle both kubelet and kube-state-metrics label formats
+      const namespace = item.metric.exported_namespace || item.metric.namespace;
+      const pvcName = item.metric.exported_persistentvolumeclaim || item.metric.persistentvolumeclaim;
+
+      const total = formatBytes(item.value[1]);
+      const usageItem = usageData.find(u =>
+        (u.metric.exported_namespace || u.metric.namespace) === namespace &&
+        (u.metric.exported_persistentvolumeclaim || u.metric.persistentvolumeclaim) === pvcName
+      );
+      // If no usage data available, show N/A
+      const usagePercent = usageItem ? round(parseFloat(usageItem.value[1])) : null;
+
+      return {
+        namespace,
+        name: pvcName,
+        total: { value: total.value, unit: total.unit },
+        usage: usagePercent !== null ? { value: usagePercent, unit: '%' } : { value: 'N/A', unit: '' },
+        critical: usagePercent !== null ? usagePercent > CONFIG.threshold : false
+      };
+    });
+
+    res.json({
+      ok: true,
+      timestamp: getTimestamp(),
+      count: pvcs.length,
+      pvcs
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// GET /metrics/node - Node durumları ve resource kullanımı
+// -----------------------------------------------------------------------------
+app.get('/metrics/node', async (req, res) => {
+  try {
+    // Try node_uname_info first (has correct instance for node-exporter), fallback to kube_node_info
+    let [
+      nodeInfoExporter,
+      nodeInfoKsm,
+      memUsage, memTotal,
+      diskUsage, diskTotal,
+      cpuUsage, cpuTotal,
+      podUsage, podTotal
+    ] = await Promise.all([
+      queryPrometheus(QUERIES.NODE_INFO_EXPORTER),
+      queryPrometheus(QUERIES.NODE_INFO_KSM),
+      queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
+      queryPrometheus(QUERIES.NODE_MEMORY_TOTAL),
+      queryPrometheus(QUERIES.NODE_DISK_USAGE),
+      queryPrometheus(QUERIES.NODE_DISK_TOTAL),
+      queryPrometheus(QUERIES.NODE_CPU_USAGE),
+      queryPrometheus(QUERIES.NODE_CPU_TOTAL),
+      queryPrometheus(QUERIES.NODE_POD_USAGE),
+      queryPrometheus(QUERIES.NODE_POD_TOTAL)
+    ]);
+
+    // Prefer node_uname_info (node-exporter), fallback to kube_node_info
+    const nodeInfo = nodeInfoExporter.length > 0 ? nodeInfoExporter : nodeInfoKsm;
+
+    const nodes = nodeInfo.map(item => {
+      // node_uname_info uses nodename, kube_node_info uses node label
+      const nodeName = item.metric.nodename || item.metric.node || item.metric.exported_node;
+      // node_uname_info has correct instance for node-exporter metrics
+      const instance = item.metric.instance;
+
+      // Memory (node-exporter uses instance label)
+      const memUsageItem = memUsage.find(m => m.metric.instance === instance);
+      const memTotalItem = memTotal.find(m => m.metric.node === nodeName);
+      const memoryUsagePercent = memUsageItem ? round(parseFloat(memUsageItem.value[1])) : 0;
+      const memoryTotal = memTotalItem ? formatBytes(memTotalItem.value[1]) : { value: 0, unit: 'GiB' };
+
+      // Disk
+      const diskUsageItem = diskUsage.find(d => d.metric.instance === instance);
+      const diskTotalItem = diskTotal.find(d => d.metric.node === nodeName);
+      const diskUsagePercent = diskUsageItem ? round(parseFloat(diskUsageItem.value[1])) : 0;
+      const diskTotalVal = diskTotalItem ? formatBytes(diskTotalItem.value[1]) : { value: 0, unit: 'GiB' };
+
+      // CPU
+      const cpuUsageItem = cpuUsage.find(c => c.metric.instance === instance);
+      const cpuTotalItem = cpuTotal.find(c => c.metric.node === nodeName);
+      const cpuUsagePercent = cpuUsageItem ? round(parseFloat(cpuUsageItem.value[1])) : 0;
+      const cpuTotalVal = cpuTotalItem ? round(parseFloat(cpuTotalItem.value[1])) : 0;
+
+      // Pod
+      const podUsageItem = podUsage.find(p => p.metric.node === nodeName);
+      const podTotalItem = podTotal.find(p => p.metric.node === nodeName);
+      const podUsagePercent = podUsageItem ? round(parseFloat(podUsageItem.value[1])) : 0;
+      const podTotalVal = podTotalItem ? round(parseFloat(podTotalItem.value[1])) : 0;
+
+      return {
+        name: nodeName,
+        instance,
+        cpu: {
+          usage: cpuUsagePercent,
+          total: cpuTotalVal,
+          unit: { usage: '%', total: 'cores' },
+          critical: cpuUsagePercent > CONFIG.threshold
+        },
+        memory: {
+          usage: memoryUsagePercent,
+          total: memoryTotal.value,
+          unit: { usage: '%', total: memoryTotal.unit },
+          critical: memoryUsagePercent > CONFIG.threshold
+        },
+        disk: {
+          usage: diskUsagePercent,
+          total: diskTotalVal.value,
+          unit: { usage: '%', total: diskTotalVal.unit },
+          critical: diskUsagePercent > CONFIG.threshold
+        },
+        pod: {
+          usage: podUsagePercent,
+          total: podTotalVal,
+          unit: { usage: '%', total: 'pods' },
+          critical: podUsagePercent > CONFIG.threshold
         }
-        else {
-            return res.json({ error: body.error });
-        }
-    });    
-})
+      };
+    });
 
-app.get('/metrics/pod', (req, res) => {
+    // Cluster summary
+    const nodeCount = nodes.length || 1;
+    const summary = {
+      nodeCount,
+      cpu: {
+        usage: round(nodes.reduce((sum, n) => sum + n.cpu.usage, 0) / nodeCount),
+        total: nodes.reduce((sum, n) => sum + n.cpu.total, 0),
+        unit: '%',
+        critical: nodes.some(n => n.cpu.critical)
+      },
+      memory: {
+        usage: round(nodes.reduce((sum, n) => sum + n.memory.usage, 0) / nodeCount),
+        total: round(nodes.reduce((sum, n) => sum + n.memory.total, 0)),
+        unit: '%',
+        critical: nodes.some(n => n.memory.critical)
+      },
+      disk: {
+        usage: round(nodes.reduce((sum, n) => sum + n.disk.usage, 0) / nodeCount),
+        total: round(nodes.reduce((sum, n) => sum + n.disk.total, 0)),
+        unit: '%',
+        critical: nodes.some(n => n.disk.critical)
+      },
+      pod: {
+        usage: round(nodes.reduce((sum, n) => sum + n.pod.usage, 0) / nodeCount),
+        total: nodes.reduce((sum, n) => sum + n.pod.total, 0),
+        unit: '%',
+        critical: nodes.some(n => n.pod.critical)
+      }
+    };
 
-    const queries = [
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_POD_STATUS)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_POD_CPU_USAGE)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_POD_MEMORY_USAGE)),
-    ];
-    const descriptions = [
-        "POD_STATUS",
-        "CPU_USAGE",
-        "MEMORY_USAGE"
-        ];
+    res.json({
+      ok: true,
+      timestamp: getTimestamp(),
+      summary,
+      nodes
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
-    // Tüm sorguların tamamlanmasını bekleyin
-    Promise.all(queries)
-        .then(responses => Promise.all(responses.map(r => r.json())))
-        .then(results => {
-            // Tüm sonuçları birleştirir
-            const combinedResults = results.reduce((acc, result ,i) => {
-                if (result.status) {
-                    result.key = descriptions[i];
-                    acc.push(result);
-                }
-                return acc;
-            }, []);
+// -----------------------------------------------------------------------------
+// GET /metrics/alerts - Aktif alertler
+// -----------------------------------------------------------------------------
+app.get('/metrics/alerts', async (req, res) => {
+  try {
+    const alerts = await fetchAlerts();
 
-            var result = combinedResults[0].data.result.map((pod)=>{
-                var mypod={usage:{}}
-                mypod.namespace = pod.metric.namespace;
-                mypod.phase = pod.metric.phase;
-                mypod.name = pod.metric.pod;
-                mypod.usage.unit = {}
-                const cpu =combinedResults[1].data.result.find(item => item.metric.namespace==mypod.namespace && item.metric.pod==mypod.name);
-                if(cpu)
-                    {
-                        mypod.usage.cpu = Math.ceil(cpu.value[1] * 100) / 100
-                        mypod.usage.unit.cpu = "Core"
-                    }
-                const memory = combinedResults[2].data.result.find(item => item.metric.namespace==mypod.namespace && item.metric.pod==mypod.name);
-                if(memory){
-                    mypod.usage.memory = parseFloat(niceBytes(memory.value[1]));
-                    mypod.usage.unit.memory = getByteUnit(memory.value[1])
-                }
-                return mypod;
-            });
-            var myresult={}
-            myresult.status = "success"
-            myresult.key = "POD_STATUS"
-            myresult.data=result
+    const formatted = alerts.map(alert => ({
+      name: alert.labels?.alertname || 'Unknown',
+      severity: alert.labels?.severity || 'unknown',
+      state: alert.state,
+      namespace: alert.labels?.namespace || '',
+      summary: alert.annotations?.summary || alert.annotations?.description || '',
+      activeAt: alert.activeAt
+    }));
 
-            res.json(myresult);
-        })
-        .catch(error => {
-            // Hataları ele alın
-            console.error('Error fetching Prometheus data:', error);
-            res.status(500).json({ error: 'Internal Server Error' });
-        });
+    const summary = {
+      total: formatted.length,
+      firing: formatted.filter(a => a.state === 'firing').length,
+      pending: formatted.filter(a => a.state === 'pending').length,
+      critical: formatted.filter(a => a.severity === 'critical').length,
+      warning: formatted.filter(a => a.severity === 'warning').length
+    };
 
-    
-})
+    res.json({
+      ok: true,
+      timestamp: getTimestamp(),
+      summary,
+      alerts: formatted
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
-app.get('/metrics/pvc', (req, res) => {
+// -----------------------------------------------------------------------------
+// GET /metrics/overview - Mobil dashboard için tek endpoint
+// -----------------------------------------------------------------------------
+app.get('/metrics/overview', async (req, res) => {
+  try {
+    const [
+      nodeInfo,
+      memUsage, cpuUsage, diskUsage, podUsage,
+      podStatus,
+      alerts
+    ] = await Promise.all([
+      queryPrometheus(QUERIES.NODE_INFO),
+      queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
+      queryPrometheus(QUERIES.NODE_CPU_USAGE),
+      queryPrometheus(QUERIES.NODE_DISK_USAGE),
+      queryPrometheus(QUERIES.NODE_POD_USAGE),
+      queryPrometheus(QUERIES.POD_STATUS),
+      fetchAlerts()
+    ]);
 
-    const queries = [
-        //----- total ----
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_PVC_TOTAL)),
-        //----- usage ----
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_PVC_USAGE)),
-    ];
-    const descriptions = [
-        "PVC_USAGE",
-        "PVC_TOTAL"
-        ];
+    const nodeCount = nodeInfo.length || 1;
 
-    // Tüm sorguların tamamlanmasını bekleyin
-    Promise.all(queries)
-        .then(responses => Promise.all(responses.map(r => r.json())))
-        .then(results => {
-            // Tüm sonuçları birleştirir
-            const combinedResults = results.reduce((acc, result ,i) => {
-                if (result.status) {
-                    result.key = descriptions[i];
-                    acc.push(result);
-                }
-                return acc;
-            }, []);
+    // Calculate averages (handle empty arrays)
+    const avgCpu = cpuUsage.length > 0 ? round(cpuUsage.reduce((sum, c) => sum + parseFloat(c.value[1] || 0), 0) / cpuUsage.length) : 0;
+    const avgMemory = memUsage.length > 0 ? round(memUsage.reduce((sum, m) => sum + parseFloat(m.value[1] || 0), 0) / memUsage.length) : 0;
+    const avgDisk = diskUsage.length > 0 ? round(diskUsage.reduce((sum, d) => sum + parseFloat(d.value[1] || 0), 0) / diskUsage.length) : 0;
+    const avgPod = podUsage.length > 0 ? round(podUsage.reduce((sum, p) => sum + parseFloat(p.value[1] || 0), 0) / podUsage.length) : 0;
 
+    // Pod summary
+    const runningPods = podStatus.filter(p => p.metric.phase === 'Running').length;
+    const totalPods = podStatus.length;
 
-            var result = combinedResults[0].data.result.map((pvc)=>{
-                var mypvc={usage:{}, total:{}}
-                mypvc.namespace = pvc.metric.namespace;
-                mypvc.persistentvolumeclaim = pvc.metric.persistentvolumeclaim;
+    // Alert summary
+    const firingAlerts = alerts.filter(a => a.state === 'firing').length;
+    const criticalAlerts = alerts.filter(a => a.labels?.severity === 'critical').length;
 
-                mypvc.total.pvc = Math.round(parseFloat(niceBytes(pvc.value[1])));
-                mypvc.total.unit = {pvc: getByteUnit(pvc.value[1])}
-                mypvc.usage.pvc = Math.round(parseFloat(combinedResults[1].data.result.find(item => item.metric.namespace==mypvc.namespace && item.metric.persistentvolumeclaim==mypvc.persistentvolumeclaim).value[1]));
-                mypvc.usage.unit = {pvc: "%"}
-                return mypvc;
-            });
-            var myresult={}
-            myresult.status = "success"
-            myresult.key = "PVC_STATUS"
-            myresult.data=result
+    res.json({
+      ok: true,
+      timestamp: getTimestamp(),
+      cluster: {
+        nodes: nodeCount,
+        pods: { running: runningPods, total: totalPods }
+      },
+      usage: {
+        cpu: { value: avgCpu, unit: '%', critical: avgCpu > CONFIG.threshold },
+        memory: { value: avgMemory, unit: '%', critical: avgMemory > CONFIG.threshold },
+        disk: { value: avgDisk, unit: '%', critical: avgDisk > CONFIG.threshold },
+        pod: { value: avgPod, unit: '%', critical: avgPod > CONFIG.threshold }
+      },
+      alerts: {
+        total: alerts.length,
+        firing: firingAlerts,
+        critical: criticalAlerts
+      },
+      healthy: avgCpu < CONFIG.threshold && avgMemory < CONFIG.threshold && avgDisk < CONFIG.threshold && criticalAlerts === 0
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
-            res.json(myresult);
-        })
-        .catch(error => {
-            // Hataları ele alın
-            console.error('Error fetching Prometheus data:', error);
-            res.status(500).json({ error: 'Internal Server Error' });
-        });
-
-    
-})
-
-
-
-app.get('/metrics/alerts', (req, res) => {
-
-    return fetch(process.env.PROMETHEUS_API_URL+'/alerts')
-    .then((response) => response.json())
-    .then((body) => {
-        console.log(body)
-        if (body.status) {
-            body.key = "ALERTS"
-            return res.json(body)
-        }
-        else {
-            return res.json({ error: body.error });
-        }
-    });    
-})
-
-app.get('/metrics/node', (req, res) => {
-
-    const queries = [
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_UNAME)),
-        //----- usage ----
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_MEMORY_USAGE)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_DISK_USAGE)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_CPU_USAGE)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_POD_USAGE)),
-        //----- total ----
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_MEMORY_TOTAL)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_DISK_TOTAL)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_CPU_TOTAL)),
-        fetch(process.env.PROMETHEUS_API_URL + '/query?query=' + encodeURIComponent(process.env.PQL_NODE_POD_TOTAL)),
-    ];
-    const descriptions = [
-        "UNAME",
-        "MEMORY_USAGE",
-        "DISK_USAGE",
-        "CPU_USAGE",
-        "POD_USAGE",
-        "MEMORY_TOTAL",
-        "DISK_TOTAL",
-        "CPU_TOTAL",
-        "POD_TOTAL"
-        ];
-
-    // Tüm sorguların tamamlanmasını bekleyin
-    Promise.all(queries)
-        .then(responses => Promise.all(responses.map(r => r.json())))
-        .then(results => {
-            // Tüm sonuçları birleştirin
-            const combinedResults = results.reduce((acc, result ,i) => {
-                if (result.status) {
-                    result.key = descriptions[i];
-                    acc.push(result); // ya da istediğiniz bir şekilde sonuçları birleştirin
-                }
-                return acc;
-            }, []);
-
-            var summary={usage:{cpu:0,disk:0,memory:0, pod:0}, total:{cpu:0,disk:0,memory:0, pod:0}, severity:{cpu: false, memory: false, disk: false, pod: false}}
-            var rawtotal={memory: 0, disk: 0};
-            var result = combinedResults[0].data.result.map((node)=>{
-                var mynode={usage:{}, total:{}}
-                mynode.name = node.metric.nodename;
-                mynode.instance = node.metric.instance;
-                // --- usage ---
-                mynode.usage.memory = Math.round(parseFloat(combinedResults[1].data.result.find(item => item.metric.instance==mynode.instance).value[1]));
-                mynode.usage.disk = Math.round(parseFloat(combinedResults[2].data.result.find(item => item.metric.instance==mynode.instance).value[1]));
-                mynode.usage.cpu = Math.round(parseFloat(combinedResults[3].data.result.find(item => item.metric.instance==mynode.instance).value[1]));
-                mynode.usage.pod = Math.round(parseFloat(combinedResults[4].data.result.find(item => item.metric.node==mynode.name).value[1]));
-                mynode.usage.unit = {cpu: "%", disk: "%", memory: "%", pod: "%"}
-                // --- total ---
-                var totalmemory = parseFloat(combinedResults[5].data.result.find(item => item.metric.node==mynode.name).value[1]);
-                mynode.total.memory = Math.round(parseFloat(niceBytes(totalmemory)));
-                var totaldisk = parseFloat(combinedResults[6].data.result.find(item => item.metric.node==mynode.name).value[1]);
-                mynode.total.disk =  Math.round(parseFloat(niceBytes(totaldisk)));
-                mynode.total.cpu = Math.round(parseFloat(combinedResults[7].data.result.find(item => item.metric.node==mynode.name).value[1]));
-                mynode.total.pod = Math.round(parseFloat(combinedResults[8].data.result.find(item => item.metric.node==mynode.name).value[1]));
-                mynode.total.unit = {cpu: "Core", disk: getByteUnit(totaldisk), memory: getByteUnit(totalmemory), pod: "Number"}
-
-                summary.usage.cpu = summary.usage.cpu +  mynode.usage.cpu;
-                summary.usage.disk = summary.usage.disk +  mynode.usage.disk;
-                summary.usage.memory = summary.usage.memory +  mynode.usage.memory;
-                summary.usage.pod = summary.usage.pod +  mynode.usage.pod;
-
-                summary.total.cpu = summary.total.cpu + mynode.total.cpu;
-                summary.total.disk = summary.total.disk + mynode.total.disk;
-                summary.total.memory = summary.total.memory + mynode.total.memory;
-                summary.total.pod = summary.total.pod + mynode.total.pod;
-                
-                rawtotal.disk = rawtotal.disk + totaldisk;
-                rawtotal.memory = rawtotal.memory + totalmemory;
-
-                if(mynode.usage.cpu > process.env.DEFAULT_THRESHOLD)
-                    summary.severity.cpu = true;                
-                if(mynode.usage.memory > process.env.DEFAULT_THRESHOLD)
-                    summary.severity.memory = true;
-                if(mynode.usage.disk > process.env.DEFAULT_THRESHOLD)
-                    summary.severity.disk = true;                
-                if(mynode.usage.pod > process.env.DEFAULT_THRESHOLD)
-                    summary.severity.pod = true;
-                return mynode;
-            });
-            var myresult={}
-            myresult.status = "success"
-            myresult.key = "NODE_STATUS"
-
-            const nodeCount = result.length;
-            summary.usage = {   cpu: Math.round(parseFloat(summary.usage.cpu/nodeCount)), 
-                                disk: Math.round(parseFloat(summary.usage.disk/nodeCount)), 
-                                memory: Math.round(parseFloat(summary.usage.memory/nodeCount)),
-                                pod: Math.round(parseFloat(summary.usage.pod/nodeCount))
-                            }
-            summary.total.disk = Math.round(parseFloat(niceBytes(summary.total.disk)));
-            summary.total.memory = Math.round(parseFloat(niceBytes(summary.total.memory)));
-            summary.usage.unit = {cpu: "%", disk: "%", memory: "%", pod: "%"}
-            summary.total.unit = {cpu: "Core", disk: getByteUnit(rawtotal.disk), memory: getByteUnit(rawtotal.memory), pod: "Number"}
-            myresult.summary = summary;
-            myresult.data=result
-
-            res.json(myresult);
-        })
-        .catch(error => {
-            // Hataları ele alın
-            console.error('Error fetching Prometheus data:', error);
-            res.status(500).json({ error: 'Internal Server Error' });
-        });
-
-    
-})
-
-app.get('/metrics/metric4', (req, res) => {
-
-    return res.send("OK");
-
-    return fetch(process.env.PROMETHEUS_API_URL+'/query?query='+encodeURIComponent(process.env.PQL_METRIC4))
-    .then((response) => response.json())
-    .then((body) => {
-        console.log(body)
-        if (body.status) {
-            return res.json(body)
-        }
-        else {
-            return res.json({ error: body.error });
-        }
-    });    
-})
-
-app.get('/metrics/metric5', (req, res) => {
-
-    return fetch(process.env.PROMETHEUS_API_URL+'/query?query='+encodeURIComponent(process.env.PQL_METRIC5))
-    .then((response) => response.json())
-    .then((body) => {
-        console.log(body)
-        if (body.status) {
-            return res.json(body)
-        }
-        else {
-            return res.json({ error: body.error });
-        }
-    });    
-})
+// ============================================================================
+// START SERVER
+// ============================================================================
 
 app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`)
-})
+  console.log(`Moniple Agent running on port ${port}`);
+  console.log(`Prometheus API: ${CONFIG.apiUrl}`);
+});
