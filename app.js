@@ -439,7 +439,6 @@ const CONFIG = {
   threshold: parseInt(process.env.DEFAULT_THRESHOLD) || 80,
   // Moniple Server config
   serverUrl: process.env.MONIPLE_SERVER_URL || "",
-  clusterId: process.env.MONIPLE_CLUSTER_ID || "",
   apiKey: process.env.MONIPLE_API_KEY || "",
   pushInterval: parseInt(process.env.PUSH_INTERVAL_SECONDS) || 60,
 };
@@ -1360,7 +1359,7 @@ async function getAlertsData() {
 
 // Push all metrics to Moniple Server
 async function pushMetricsToServer() {
-  if (!CONFIG.serverUrl || !CONFIG.clusterId || !CONFIG.apiKey) {
+  if (!CONFIG.serverUrl || !CONFIG.apiKey) {
     return; // Server not configured, skip push
   }
 
@@ -1396,12 +1395,12 @@ async function pushMetricsToServer() {
     ]);
 
     // Push to server using /api/v1/agent/snapshots endpoint
+    // Cluster ID is automatically resolved from API key on server side
     const response = await fetch(`${CONFIG.serverUrl}/api/v1/agent/snapshots`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${CONFIG.apiKey}`,
-        "X-Cluster-ID": CONFIG.clusterId,
       },
       body: JSON.stringify({
         overview,
@@ -1429,7 +1428,7 @@ async function pushMetricsToServer() {
 
 // Start push interval
 function startMetricsPush() {
-  if (!CONFIG.serverUrl || !CONFIG.clusterId || !CONFIG.apiKey) {
+  if (!CONFIG.serverUrl || !CONFIG.apiKey) {
     console.log("Moniple Server not configured. Skipping metrics push.");
     return;
   }
