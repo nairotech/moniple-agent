@@ -1,6 +1,10 @@
 const express = require("express");
 const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
+const k8s = require("@kubernetes/client-node");
+const yaml = require("js-yaml");
+const fs = require("fs");
+const path = require("path");
 require("dotenv").config();
 
 const app = express();
@@ -441,7 +445,320 @@ const CONFIG = {
   serverUrl: process.env.MONIPLE_SERVER_URL || "",
   apiKey: process.env.MONIPLE_API_KEY || "",
   pushInterval: parseInt(process.env.PUSH_INTERVAL_SECONDS) || 60,
+  // Auto-install monitoring stack
+  autoInstallMonitoring: process.env.AUTO_INSTALL_MONITORING !== "false",
+  monitoringNamespace: process.env.MONITORING_NAMESPACE || "moniple",
 };
+
+// ============================================================================
+// KUBERNETES CLIENT & AUTO-INSTALL MONITORING STACK
+// ============================================================================
+
+let kc = null;
+let k8sAppsApi = null;
+let k8sCoreApi = null;
+let k8sRbacApi = null;
+
+function initKubernetesClient() {
+  try {
+    kc = new k8s.KubeConfig();
+    // Try in-cluster config first, fallback to default kubeconfig
+    try {
+      kc.loadFromCluster();
+      console.log("Loaded in-cluster Kubernetes config");
+    } catch (e) {
+      kc.loadFromDefault();
+      console.log("Loaded default Kubernetes config");
+    }
+    k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api);
+    k8sCoreApi = kc.makeApiClient(k8s.CoreV1Api);
+    k8sRbacApi = kc.makeApiClient(k8s.RbacAuthorizationV1Api);
+    return true;
+  } catch (error) {
+    console.error("Failed to initialize Kubernetes client:", error.message);
+    return false;
+  }
+}
+
+async function ensureNamespace(namespace) {
+  try {
+    await k8sCoreApi.readNamespace({ name: namespace });
+    console.log(`Namespace '${namespace}' already exists`);
+    return true;
+  } catch (error) {
+    if (error.response?.statusCode === 404) {
+      try {
+        await k8sCoreApi.createNamespace({
+          body: {
+            apiVersion: "v1",
+            kind: "Namespace",
+            metadata: { name: namespace },
+          },
+        });
+        console.log(`Created namespace '${namespace}'`);
+        return true;
+      } catch (createError) {
+        console.error(`Failed to create namespace:`, createError.message);
+        return false;
+      }
+    }
+    console.error(`Error checking namespace:`, error.message);
+    return false;
+  }
+}
+
+async function checkDeploymentExists(name, namespace) {
+  try {
+    await k8sAppsApi.readNamespacedDeployment({ name, namespace });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function checkDaemonSetExists(name, namespace) {
+  try {
+    await k8sAppsApi.readNamespacedDaemonSet({ name, namespace });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function applyManifest(manifestPath, namespace) {
+  try {
+    const fileContent = fs.readFileSync(manifestPath, "utf8");
+    const manifests = yaml.loadAll(fileContent);
+
+    for (const manifest of manifests) {
+      if (!manifest) continue;
+
+      // Override namespace
+      if (
+        manifest.metadata &&
+        manifest.kind !== "ClusterRole" &&
+        manifest.kind !== "ClusterRoleBinding"
+      ) {
+        manifest.metadata.namespace = namespace;
+      }
+
+      const kind = manifest.kind;
+      const name = manifest.metadata?.name;
+
+      try {
+        switch (kind) {
+          case "Namespace":
+            await ensureNamespace(manifest.metadata.name);
+            break;
+
+          case "ServiceAccount":
+            try {
+              await k8sCoreApi.readNamespacedServiceAccount({
+                name,
+                namespace,
+              });
+              console.log(`ServiceAccount '${name}' already exists`);
+            } catch (e) {
+              await k8sCoreApi.createNamespacedServiceAccount({
+                namespace,
+                body: manifest,
+              });
+              console.log(`Created ServiceAccount '${name}'`);
+            }
+            break;
+
+          case "ConfigMap":
+            try {
+              await k8sCoreApi.readNamespacedConfigMap({ name, namespace });
+              await k8sCoreApi.replaceNamespacedConfigMap({
+                name,
+                namespace,
+                body: manifest,
+              });
+              console.log(`Updated ConfigMap '${name}'`);
+            } catch (e) {
+              await k8sCoreApi.createNamespacedConfigMap({
+                namespace,
+                body: manifest,
+              });
+              console.log(`Created ConfigMap '${name}'`);
+            }
+            break;
+
+          case "Secret":
+            try {
+              await k8sCoreApi.readNamespacedSecret({ name, namespace });
+              console.log(`Secret '${name}' already exists`);
+            } catch (e) {
+              await k8sCoreApi.createNamespacedSecret({
+                namespace,
+                body: manifest,
+              });
+              console.log(`Created Secret '${name}'`);
+            }
+            break;
+
+          case "Service":
+            try {
+              await k8sCoreApi.readNamespacedService({ name, namespace });
+              console.log(`Service '${name}' already exists`);
+            } catch (e) {
+              await k8sCoreApi.createNamespacedService({
+                namespace,
+                body: manifest,
+              });
+              console.log(`Created Service '${name}'`);
+            }
+            break;
+
+          case "PersistentVolumeClaim":
+            try {
+              await k8sCoreApi.readNamespacedPersistentVolumeClaim({
+                name,
+                namespace,
+              });
+              console.log(`PVC '${name}' already exists`);
+            } catch (e) {
+              await k8sCoreApi.createNamespacedPersistentVolumeClaim({
+                namespace,
+                body: manifest,
+              });
+              console.log(`Created PVC '${name}'`);
+            }
+            break;
+
+          case "Deployment":
+            try {
+              await k8sAppsApi.readNamespacedDeployment({ name, namespace });
+              console.log(`Deployment '${name}' already exists`);
+            } catch (e) {
+              await k8sAppsApi.createNamespacedDeployment({
+                namespace,
+                body: manifest,
+              });
+              console.log(`Created Deployment '${name}'`);
+            }
+            break;
+
+          case "DaemonSet":
+            try {
+              await k8sAppsApi.readNamespacedDaemonSet({ name, namespace });
+              console.log(`DaemonSet '${name}' already exists`);
+            } catch (e) {
+              await k8sAppsApi.createNamespacedDaemonSet({
+                namespace,
+                body: manifest,
+              });
+              console.log(`Created DaemonSet '${name}'`);
+            }
+            break;
+
+          case "ClusterRole":
+            try {
+              await k8sRbacApi.readClusterRole({ name });
+              console.log(`ClusterRole '${name}' already exists`);
+            } catch (e) {
+              await k8sRbacApi.createClusterRole({ body: manifest });
+              console.log(`Created ClusterRole '${name}'`);
+            }
+            break;
+
+          case "ClusterRoleBinding":
+            try {
+              await k8sRbacApi.readClusterRoleBinding({ name });
+              console.log(`ClusterRoleBinding '${name}' already exists`);
+            } catch (e) {
+              // Update namespace in subjects
+              if (manifest.subjects) {
+                manifest.subjects.forEach((s) => {
+                  if (s.namespace) s.namespace = namespace;
+                });
+              }
+              await k8sRbacApi.createClusterRoleBinding({ body: manifest });
+              console.log(`Created ClusterRoleBinding '${name}'`);
+            }
+            break;
+
+          default:
+            console.log(`Skipping unsupported kind: ${kind}`);
+        }
+      } catch (applyError) {
+        console.error(`Error applying ${kind} '${name}':`, applyError.message);
+      }
+    }
+    return true;
+  } catch (error) {
+    console.error(`Error reading manifest ${manifestPath}:`, error.message);
+    return false;
+  }
+}
+
+async function ensureMonitoringStack() {
+  const namespace = CONFIG.monitoringNamespace;
+  console.log(`\n========================================`);
+  console.log(`Checking monitoring stack in namespace '${namespace}'...`);
+  console.log(`========================================\n`);
+
+  // Ensure namespace exists
+  await ensureNamespace(namespace);
+
+  const manifestsDir = path.join(__dirname, "manifests");
+
+  // Check if manifests directory exists
+  if (!fs.existsSync(manifestsDir)) {
+    console.log("Manifests directory not found. Skipping auto-install.");
+    return;
+  }
+
+  // Check and install Victoria Metrics
+  const vmExists = await checkDeploymentExists("vmsingle", namespace);
+  if (!vmExists) {
+    console.log("\n--- Installing Victoria Metrics ---");
+    await applyManifest(
+      path.join(manifestsDir, "victoria-metrics.yaml"),
+      namespace,
+    );
+  } else {
+    console.log("Victoria Metrics already installed");
+  }
+
+  // Check and install kube-state-metrics
+  const ksmExists = await checkDeploymentExists(
+    "kube-state-metrics",
+    namespace,
+  );
+  if (!ksmExists) {
+    console.log("\n--- Installing kube-state-metrics ---");
+    await applyManifest(
+      path.join(manifestsDir, "kube-state-metrics.yaml"),
+      namespace,
+    );
+  } else {
+    console.log("kube-state-metrics already installed");
+  }
+
+  // Check and install node-exporter
+  const neExists = await checkDaemonSetExists("node-exporter", namespace);
+  if (!neExists) {
+    console.log("\n--- Installing node-exporter ---");
+    await applyManifest(
+      path.join(manifestsDir, "node-exporter.yaml"),
+      namespace,
+    );
+  } else {
+    console.log("node-exporter already installed");
+  }
+
+  // Update Prometheus API URL to point to local vmsingle if not set
+  if (CONFIG.apiUrl === "http://prometheus:9090/api/v1") {
+    CONFIG.apiUrl = `http://vmsingle.${namespace}.svc:8428/api/v1`;
+    console.log(`\nUpdated PROMETHEUS_API_URL to: ${CONFIG.apiUrl}`);
+  }
+
+  console.log(`\n========================================`);
+  console.log(`Monitoring stack check complete`);
+  console.log(`========================================\n`);
+}
 
 // ============================================================================
 // EMBEDDED PROMQL QUERIES (Compatible with both Prometheus & Victoria Metrics)
@@ -1448,10 +1765,34 @@ function startMetricsPush() {
 // START SERVER
 // ============================================================================
 
-app.listen(port, () => {
-  console.log(`Moniple Agent running on port ${port}`);
-  console.log(`Prometheus API: ${CONFIG.apiUrl}`);
+async function startServer() {
+  // Initialize Kubernetes client and ensure monitoring stack
+  if (CONFIG.autoInstallMonitoring) {
+    const k8sInitialized = initKubernetesClient();
+    if (k8sInitialized) {
+      try {
+        await ensureMonitoringStack();
+      } catch (error) {
+        console.error("Error ensuring monitoring stack:", error.message);
+      }
+    } else {
+      console.log("Kubernetes client not available. Skipping auto-install.");
+    }
+  } else {
+    console.log(
+      "Auto-install monitoring disabled (AUTO_INSTALL_MONITORING=false)",
+    );
+  }
 
-  // Start pushing metrics to server
-  startMetricsPush();
-});
+  // Start Express server
+  app.listen(port, () => {
+    console.log(`Moniple Agent running on port ${port}`);
+    console.log(`Prometheus API: ${CONFIG.apiUrl}`);
+
+    // Start pushing metrics to server
+    startMetricsPush();
+  });
+}
+
+// Start the server
+startServer();
