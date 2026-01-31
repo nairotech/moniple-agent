@@ -105,13 +105,18 @@ PORT=3000
 
 ## Docker Image
 
+**IMPORTANT:** Her zaman `--platform linux/amd64` flag'i ile build yap!
+
 ```bash
-# Build & Push
+# Build & Push (HER ZAMAN BU KOMUTU KULLAN)
+docker buildx build --platform linux/amd64 -t muhgumus/moniple-agent:main --push .
+
+# Multi-platform build (opsiyonel)
 docker buildx build --platform linux/amd64,linux/arm64 -t muhgumus/moniple-agent:main --push .
 ```
 
-**Image:** `muhgumus/moniple-agent:main` / `muhgumus/moniple-agent:latest`
-**Platforms:** linux/amd64, linux/arm64
+**Image:** `muhgumus/moniple-agent:main`
+**Platform:** linux/amd64 (Kubernetes cluster'lar için)
 
 ---
 
