@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "moniple-agent.fullname" . }}
+  labels:
+    {{- include "moniple-agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "moniple-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "moniple-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            # Prometheus/Victoria Metrics API URL
+            - name: PROMETHEUS_API_URL
+              value: {{ include "moniple-agent.prometheusApiUrl" . | quote }}
+
+            # Default threshold for critical alerts
+            - name: DEFAULT_THRESHOLD
+              value: {{ .Values.config.defaultThreshold | quote }}
+
+            # Basic auth for Prometheus (optional)
+            {{- if .Values.config.apiUser }}
+            - name: PROMETHEUS_API_USER
+              value: {{ .Values.config.apiUser | quote }}
+            {{- end }}
+            {{- if .Values.config.apiPassword }}
+            - name: PROMETHEUS_API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "moniple-agent.fullname" . }}-secrets
+                  key: prometheus-password
+            {{- end }}
+
+            # Moniple Server push configuration (optional)
+            {{- if .Values.config.monipleServerUrl }}
+            - name: MONIPLE_SERVER_URL
+              value: {{ .Values.config.monipleServerUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.apiKey }}
+            - name: MONIPLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "moniple-agent.fullname" . }}-secrets
+                  key: moniple-api-key
+            {{- end }}
+            {{- if .Values.config.pushIntervalSeconds }}
+            - name: PUSH_INTERVAL_SECONDS
+              value: {{ .Values.config.pushIntervalSeconds | quote }}
+            {{- end }}
+
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}

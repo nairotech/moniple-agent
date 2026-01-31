@@ -1,0 +1,48 @@
+apiVersion: v2
+name: moniple-agent
+description: Kubernetes monitoring agent for mobile applications with auto-install monitoring stack
+version: 1.0.0
+appVersion: "1.0.0"
+type: application
+
+keywords:
+  - kubernetes
+  - monitoring
+  - prometheus
+  - victoria-metrics
+  - mobile
+
+home: https://github.com/muhgumus/moniple-agent
+sources:
+  - https://github.com/muhgumus/moniple-agent
+
+maintainers:
+  - name: Muhammed Gumus
+    email: muhgumus@gmail.com
+
+dependencies:
+  # Victoria Metrics Single - Time series database
+  - name: victoria-metrics-single
+    version: "0.9.*"
+    repository: "https://victoriametrics.github.io/helm-charts/"
+    condition: victoria-metrics.enabled
+    alias: vmsingle
+
+  # Victoria Metrics Agent - Scraper
+  - name: victoria-metrics-agent
+    version: "0.10.*"
+    repository: "https://victoriametrics.github.io/helm-charts/"
+    condition: victoria-metrics.enabled
+    alias: vmagent
+
+  # kube-state-metrics - Kubernetes objects state
+  - name: kube-state-metrics
+    version: "5.*"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: kube-state-metrics.enabled
+
+  # node-exporter - Node system metrics
+  - name: prometheus-node-exporter
+    version: "4.*"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: node-exporter.enabled

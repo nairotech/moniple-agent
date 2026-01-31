@@ -1,0 +1,51 @@
+{{- if index .Values "victoria-metrics" "enabled" }}
+# ServiceAccount for vmagent to access Kubernetes API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "moniple-agent.fullname" . }}-vmagent
+  labels:
+    {{- include "moniple-agent.labels" . | nindent 4 }}
+---
+# ClusterRole for vmagent service discovery and kubelet scraping
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "moniple-agent.fullname" . }}-vmagent
+  labels:
+    {{- include "moniple-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - nodes/metrics
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources:
+      - ingresses
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs:
+      - /metrics
+      - /metrics/cadvisor
+    verbs: ["get"]
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "moniple-agent.fullname" . }}-vmagent
+  labels:
+    {{- include "moniple-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "moniple-agent.fullname" . }}-vmagent
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "moniple-agent.fullname" . }}-vmagent
+    namespace: {{ .Release.Namespace }}
+{{- end }}

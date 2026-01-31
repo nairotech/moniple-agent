@@ -1,0 +1,175 @@
+# moniple-agent Helm Chart Values
+# Default configuration for moniple-agent with monitoring stack
+
+# =============================================================================
+# MONIPLE AGENT CONFIGURATION
+# =============================================================================
+
+replicaCount: 1
+
+image:
+  repository: muhgumus/moniple-agent
+  tag: main
+  pullPolicy: Always
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 3000
+
+# Agent environment configuration
+config:
+  # Prometheus/Victoria Metrics API URL
+  # Leave empty to auto-configure when victoria-metrics.enabled=true
+  prometheusApiUrl: ""
+
+  # Basic auth for Prometheus (optional)
+  apiUser: ""
+  apiPassword: ""
+
+  # Critical threshold percentage (default: 80)
+  defaultThreshold: "80"
+
+  # Moniple Server configuration (for push mode)
+  monipleServerUrl: ""
+  apiKey: ""
+  pushIntervalSeconds: "60"
+
+# Resource limits
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Health probes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity
+affinity: {}
+
+# =============================================================================
+# DEPENDENCY TOGGLES
+# Set to false if the component is already installed in your cluster
+# =============================================================================
+
+victoria-metrics:
+  enabled: true
+
+kube-state-metrics:
+  enabled: true
+
+node-exporter:
+  enabled: true
+
+# =============================================================================
+# VICTORIA METRICS SINGLE CONFIGURATION
+# Time series database
+# =============================================================================
+
+vmsingle:
+  server:
+    # Data retention period
+    retentionPeriod: 30d
+
+    # Persistent volume for data storage
+    persistentVolume:
+      enabled: true
+      size: 10Gi
+      storageClass: ""
+
+    # Resource limits
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+# =============================================================================
+# VICTORIA METRICS AGENT CONFIGURATION
+# Scraper agent with Kubernetes service discovery
+# =============================================================================
+
+vmagent:
+  # Resource limits
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
+  # Use our custom scrape config
+  spec:
+    # Note: remoteWrite will be configured in vmagent-extra.yaml template
+    extraArgs:
+      promscrape.config: /etc/vmagent-config/scrape.yaml
+
+    # Mount our custom scrape config
+    extraVolumes:
+      - name: vmagent-config
+        configMap:
+          name: '{{ include "moniple-agent.fullname" . }}-vmagent-config'
+
+    extraVolumeMounts:
+      - name: vmagent-config
+        mountPath: /etc/vmagent-config
+
+# =============================================================================
+# KUBE-STATE-METRICS CONFIGURATION
+# Kubernetes objects state exporter
+# =============================================================================
+
+kube-state-metrics:
+  # Use defaults from the chart
+  # Exposes metrics on port 8080
+
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+# =============================================================================
+# PROMETHEUS NODE EXPORTER CONFIGURATION
+# Node system metrics exporter (DaemonSet)
+# =============================================================================
+
+prometheus-node-exporter:
+  # Use defaults from the chart
+  # Runs on every node as DaemonSet
+
+  resources:
+    limits:
+      cpu: 100m
+      memory: 64Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi

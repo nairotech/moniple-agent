@@ -146,9 +146,74 @@ curl http://localhost:3000/metrics/overview | jq '.'
 
 ---
 
-## Sonraki Adımlar (TODO)
+## Helm Chart (Auto-Install Monitoring Stack)
 
-- [ ] Kubernetes Deployment YAML oluştur
-- [ ] Cluster'a deploy et
-- [ ] Alerting kuralları ekle (vmalert)
-- [ ] Grafana dashboard entegrasyonu
+### Yapı
+```
+chart/
+├── Chart.yaml              # Dependencies tanımları
+├── values.yaml             # Default konfigürasyon
+└── templates/
+    ├── _helpers.tpl        # Template yardımcıları
+    ├── deployment.yaml     # Agent deployment
+    ├── service.yaml        # Agent service
+    ├── secrets.yaml        # API key, password
+    ├── vmagent-config.yaml # Scrape konfigürasyonu
+    ├── vmagent-rbac.yaml   # RBAC for vmagent
+    └── NOTES.txt           # Kurulum sonrası bilgiler
+```
+
+### Dependencies
+Helm chart aşağıdaki bileşenleri otomatik kurar:
+- `victoria-metrics-single` - Time series database
+- `victoria-metrics-agent` - Metrics scraper
+- `kube-state-metrics` - Kubernetes object states
+- `prometheus-node-exporter` - Node system metrics
+
+### Kurulum
+
+**Sıfırdan Kurulum:**
+```bash
+helm repo add vm https://victoriametrics.github.io/helm-charts/
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+cd moniple-agent
+helm dependency update ./chart
+helm install moniple ./chart -n moniple --create-namespace
+```
+
+**Mevcut Monitoring ile:**
+```bash
+helm install moniple ./chart -n moniple --create-namespace \
+  --set victoria-metrics.enabled=false \
+  --set kube-state-metrics.enabled=false \
+  --set node-exporter.enabled=false \
+  --set config.prometheusApiUrl=http://existing-vm:8428/api/v1
+```
+
+### values.yaml Önemli Ayarlar
+```yaml
+victoria-metrics:
+  enabled: true    # false = mevcut VM kullan
+
+kube-state-metrics:
+  enabled: true    # false = mevcut KSM kullan
+
+node-exporter:
+  enabled: true    # false = mevcut NE kullan
+
+config:
+  prometheusApiUrl: ""  # Boş = otomatik (VM enabled ise)
+```
+
+---
+
+## Değişiklik Geçmişi
+
+### 2024-01-01 - Helm Chart Eklendi
+- Auto-install monitoring stack özelliği eklendi
+- Victoria Metrics, kube-state-metrics, node-exporter dependencies
+- vmagent scrape konfigürasyonu
+- RBAC templates
+- Kurulum sonrası NOTES.txt
