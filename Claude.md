@@ -148,74 +148,123 @@ curl http://localhost:3000/metrics/overview | jq '.'
 
 ---
 
-## Helm Chart (Auto-Install Monitoring Stack)
+## Auto-Install Monitoring Stack (Raw Manifests)
 
-### Yapı
+Agent, Kubernetes cluster'a deploy edildiğinde otomatik olarak monitoring bileşenlerini kurar.
+
+### Nasıl Çalışır
+1. Agent pod başlar
+2. Kubernetes API'ye bağlanır (in-cluster config)
+3. `moniple` namespace'inde bileşenler var mı kontrol eder
+4. Yoksa `manifests/` klasöründeki YAML'ları apply eder
+5. `PROMETHEUS_API_URL` otomatik olarak `http://vmsingle.moniple.svc:8428/api/v1` olarak ayarlanır
+
+### Kurulan Bileşenler
+| Bileşen | Tür | Açıklama |
+|---------|-----|----------|
+| vmsingle | Deployment | Victoria Metrics time series database |
+| vmagent | Deployment | Metrics scraper (kubelet, cadvisor, KSM, NE) |
+| kube-state-metrics | Deployment | Kubernetes object states |
+| node-exporter | DaemonSet | Node system metrics |
+
+### Manifest Dosyaları
 ```
-chart/
-├── Chart.yaml              # Dependencies tanımları
-├── values.yaml             # Default konfigürasyon
-└── templates/
-    ├── _helpers.tpl        # Template yardımcıları
-    ├── deployment.yaml     # Agent deployment
-    ├── service.yaml        # Agent service
-    ├── secrets.yaml        # API key, password
-    ├── vmagent-config.yaml # Scrape konfigürasyonu
-    ├── vmagent-rbac.yaml   # RBAC for vmagent
-    └── NOTES.txt           # Kurulum sonrası bilgiler
-```
-
-### Dependencies
-Helm chart aşağıdaki bileşenleri otomatik kurar:
-- `victoria-metrics-single` - Time series database
-- `victoria-metrics-agent` - Metrics scraper
-- `kube-state-metrics` - Kubernetes object states
-- `prometheus-node-exporter` - Node system metrics
-
-### Kurulum
-
-**Sıfırdan Kurulum:**
-```bash
-helm repo add vm https://victoriametrics.github.io/helm-charts/
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
-
-cd moniple-agent
-helm dependency update ./chart
-helm install moniple ./chart -n moniple --create-namespace
+manifests/
+├── victoria-metrics.yaml   # vmsingle + vmagent + RBAC + ConfigMap
+├── kube-state-metrics.yaml # KSM + RBAC
+└── node-exporter.yaml      # DaemonSet + Service
 ```
 
-**Mevcut Monitoring ile:**
-```bash
-helm install moniple ./chart -n moniple --create-namespace \
-  --set victoria-metrics.enabled=false \
-  --set kube-state-metrics.enabled=false \
-  --set node-exporter.enabled=false \
-  --set config.prometheusApiUrl=http://existing-vm:8428/api/v1
-```
+### Environment Variables
+| Variable | Default | Açıklama |
+|----------|---------|----------|
+| `AUTO_INSTALL_MONITORING` | `true` | `false` = auto-install kapalı |
+| `MONITORING_NAMESPACE` | `moniple` | Kurulum yapılacak namespace |
+| `PROMETHEUS_API_URL` | (auto) | Boş bırakılırsa vmsingle'a otomatik bağlanır |
 
-### values.yaml Önemli Ayarlar
+### RBAC Gereksinimleri
+Agent pod'un Kubernetes API'ye erişebilmesi için ServiceAccount ve ClusterRole gerekiyor:
+
 ```yaml
-victoria-metrics:
-  enabled: true    # false = mevcut VM kullan
+# moniple-gitops/test/moniple/moniple-agent/00-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moniple-agent
+  namespace: moniple
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moniple-agent
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods", "services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims", "nodes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
 
-kube-state-metrics:
-  enabled: true    # false = mevcut KSM kullan
+### Deployment'ta ServiceAccount
+```yaml
+spec:
+  template:
+    spec:
+      serviceAccountName: moniple-agent
+```
 
-node-exporter:
-  enabled: true    # false = mevcut NE kullan
+### Devre Dışı Bırakma
+Mevcut monitoring stack'iniz varsa auto-install'ı kapatabilirsiniz:
 
-config:
-  prometheusApiUrl: ""  # Boş = otomatik (VM enabled ise)
+```yaml
+env:
+  - name: AUTO_INSTALL_MONITORING
+    value: "false"
+  - name: PROMETHEUS_API_URL
+    value: "http://your-prometheus:9090/api/v1"
+```
+
+---
+
+## Karşılaşılan Sorunlar ve Çözümler
+
+### 1. Kubernetes API Erişim Hatası
+**Hata:** `HTTP request failed`
+**Çözüm:** ServiceAccount ve ClusterRole/ClusterRoleBinding oluşturulmalı
+
+### 2. node-exporter Docker Desktop Hatası
+**Hata:** `path / is mounted on / but it is not a shared or slave mount`
+**Çözüm:** rootfs mount kaldırıldı, `--no-collector.filesystem` eklendi
+
+### 3. .env Dosyası Image'a Dahil Oluyordu
+**Hata:** Local `.env` dosyası Docker image'a kopyalanıyordu
+**Çözüm:** `.dockerignore` dosyası oluşturuldu
+
+### 4. Kubernetes Client API Parametreleri
+**Hata:** `Required parameter body was null or undefined`
+**Çözüm:** API çağrıları positional parametrelere çevrildi:
+```javascript
+// Yanlış
+await k8sCoreApi.createNamespacedDeployment({ namespace, body: manifest });
+
+// Doğru
+await k8sCoreApi.createNamespacedDeployment(namespace, manifest);
 ```
 
 ---
 
 ## Değişiklik Geçmişi
 
-### 2024-01-01 - Helm Chart Eklendi
-- Auto-install monitoring stack özelliği eklendi
-- Victoria Metrics, kube-state-metrics, node-exporter dependencies
-- vmagent scrape konfigürasyonu
-- RBAC templates
-- Kurulum sonrası NOTES.txt
+### 2026-02-01 - Auto-Install via Raw Manifests
+- Helm chart kaldırıldı, raw manifest yaklaşımına geçildi
+- `@kubernetes/client-node` ve `js-yaml` dependencies eklendi
+- `manifests/` klasörü oluşturuldu (victoria-metrics, kube-state-metrics, node-exporter)
+- `ensureMonitoringStack()` fonksiyonu eklendi
+- Startup'ta otomatik monitoring stack kontrolü ve kurulumu
+- `.dockerignore` dosyası eklendi
+- RBAC gereksinimleri belirlendi (moniple-gitops'a eklendi)
+- Docker Desktop uyumluluğu sağlandı (node-exporter düzeltmesi)
