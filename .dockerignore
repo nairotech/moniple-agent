@@ -1,0 +1,14 @@
+node_modules
+.DS_Store
+.env
+.env.*
+!.env.template
+.git
+.github
+.gitlab-ci.yml
+.vscode
+.claude
+*.md
+!README.md
+azure-pipelines.yml
+sonarqube.properties

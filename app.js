@@ -482,18 +482,16 @@ function initKubernetesClient() {
 
 async function ensureNamespace(namespace) {
   try {
-    await k8sCoreApi.readNamespace({ name: namespace });
+    await k8sCoreApi.readNamespace(namespace);
     console.log(`Namespace '${namespace}' already exists`);
     return true;
   } catch (error) {
-    if (error.response?.statusCode === 404) {
+    if (error.statusCode === 404 || error.response?.statusCode === 404) {
       try {
         await k8sCoreApi.createNamespace({
-          body: {
-            apiVersion: "v1",
-            kind: "Namespace",
-            metadata: { name: namespace },
-          },
+          apiVersion: "v1",
+          kind: "Namespace",
+          metadata: { name: namespace },
         });
         console.log(`Created namespace '${namespace}'`);
         return true;
@@ -509,7 +507,7 @@ async function ensureNamespace(namespace) {
 
 async function checkDeploymentExists(name, namespace) {
   try {
-    await k8sAppsApi.readNamespacedDeployment({ name, namespace });
+    await k8sAppsApi.readNamespacedDeployment(name, namespace);
     return true;
   } catch (error) {
     return false;
@@ -518,7 +516,7 @@ async function checkDeploymentExists(name, namespace) {
 
 async function checkDaemonSetExists(name, namespace) {
   try {
-    await k8sAppsApi.readNamespacedDaemonSet({ name, namespace });
+    await k8sAppsApi.readNamespacedDaemonSet(name, namespace);
     return true;
   } catch (error) {
     return false;
@@ -553,119 +551,101 @@ async function applyManifest(manifestPath, namespace) {
 
           case "ServiceAccount":
             try {
-              await k8sCoreApi.readNamespacedServiceAccount({
-                name,
-                namespace,
-              });
+              await k8sCoreApi.readNamespacedServiceAccount(name, namespace);
               console.log(`ServiceAccount '${name}' already exists`);
             } catch (e) {
-              await k8sCoreApi.createNamespacedServiceAccount({
+              await k8sCoreApi.createNamespacedServiceAccount(
                 namespace,
-                body: manifest,
-              });
+                manifest,
+              );
               console.log(`Created ServiceAccount '${name}'`);
             }
             break;
 
           case "ConfigMap":
             try {
-              await k8sCoreApi.readNamespacedConfigMap({ name, namespace });
-              await k8sCoreApi.replaceNamespacedConfigMap({
+              await k8sCoreApi.readNamespacedConfigMap(name, namespace);
+              await k8sCoreApi.replaceNamespacedConfigMap(
                 name,
                 namespace,
-                body: manifest,
-              });
+                manifest,
+              );
               console.log(`Updated ConfigMap '${name}'`);
             } catch (e) {
-              await k8sCoreApi.createNamespacedConfigMap({
-                namespace,
-                body: manifest,
-              });
+              await k8sCoreApi.createNamespacedConfigMap(namespace, manifest);
               console.log(`Created ConfigMap '${name}'`);
             }
             break;
 
           case "Secret":
             try {
-              await k8sCoreApi.readNamespacedSecret({ name, namespace });
+              await k8sCoreApi.readNamespacedSecret(name, namespace);
               console.log(`Secret '${name}' already exists`);
             } catch (e) {
-              await k8sCoreApi.createNamespacedSecret({
-                namespace,
-                body: manifest,
-              });
+              await k8sCoreApi.createNamespacedSecret(namespace, manifest);
               console.log(`Created Secret '${name}'`);
             }
             break;
 
           case "Service":
             try {
-              await k8sCoreApi.readNamespacedService({ name, namespace });
+              await k8sCoreApi.readNamespacedService(name, namespace);
               console.log(`Service '${name}' already exists`);
             } catch (e) {
-              await k8sCoreApi.createNamespacedService({
-                namespace,
-                body: manifest,
-              });
+              await k8sCoreApi.createNamespacedService(namespace, manifest);
               console.log(`Created Service '${name}'`);
             }
             break;
 
           case "PersistentVolumeClaim":
             try {
-              await k8sCoreApi.readNamespacedPersistentVolumeClaim({
+              await k8sCoreApi.readNamespacedPersistentVolumeClaim(
                 name,
                 namespace,
-              });
+              );
               console.log(`PVC '${name}' already exists`);
             } catch (e) {
-              await k8sCoreApi.createNamespacedPersistentVolumeClaim({
+              await k8sCoreApi.createNamespacedPersistentVolumeClaim(
                 namespace,
-                body: manifest,
-              });
+                manifest,
+              );
               console.log(`Created PVC '${name}'`);
             }
             break;
 
           case "Deployment":
             try {
-              await k8sAppsApi.readNamespacedDeployment({ name, namespace });
+              await k8sAppsApi.readNamespacedDeployment(name, namespace);
               console.log(`Deployment '${name}' already exists`);
             } catch (e) {
-              await k8sAppsApi.createNamespacedDeployment({
-                namespace,
-                body: manifest,
-              });
+              await k8sAppsApi.createNamespacedDeployment(namespace, manifest);
               console.log(`Created Deployment '${name}'`);
             }
             break;
 
           case "DaemonSet":
             try {
-              await k8sAppsApi.readNamespacedDaemonSet({ name, namespace });
+              await k8sAppsApi.readNamespacedDaemonSet(name, namespace);
               console.log(`DaemonSet '${name}' already exists`);
             } catch (e) {
-              await k8sAppsApi.createNamespacedDaemonSet({
-                namespace,
-                body: manifest,
-              });
+              await k8sAppsApi.createNamespacedDaemonSet(namespace, manifest);
               console.log(`Created DaemonSet '${name}'`);
             }
             break;
 
           case "ClusterRole":
             try {
-              await k8sRbacApi.readClusterRole({ name });
+              await k8sRbacApi.readClusterRole(name);
               console.log(`ClusterRole '${name}' already exists`);
             } catch (e) {
-              await k8sRbacApi.createClusterRole({ body: manifest });
+              await k8sRbacApi.createClusterRole(manifest);
               console.log(`Created ClusterRole '${name}'`);
             }
             break;
 
           case "ClusterRoleBinding":
             try {
-              await k8sRbacApi.readClusterRoleBinding({ name });
+              await k8sRbacApi.readClusterRoleBinding(name);
               console.log(`ClusterRoleBinding '${name}' already exists`);
             } catch (e) {
               // Update namespace in subjects
@@ -674,7 +654,7 @@ async function applyManifest(manifestPath, namespace) {
                   if (s.namespace) s.namespace = namespace;
                 });
               }
-              await k8sRbacApi.createClusterRoleBinding({ body: manifest });
+              await k8sRbacApi.createClusterRoleBinding(manifest);
               console.log(`Created ClusterRoleBinding '${name}'`);
             }
             break;
