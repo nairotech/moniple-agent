@@ -458,6 +458,8 @@ let kc = null;
 let k8sAppsApi = null;
 let k8sCoreApi = null;
 let k8sRbacApi = null;
+let k8sStorageApi = null;
+let hasDefaultStorageClass = false;
 
 function initKubernetesClient() {
   try {
@@ -473,6 +475,7 @@ function initKubernetesClient() {
     k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api);
     k8sCoreApi = kc.makeApiClient(k8s.CoreV1Api);
     k8sRbacApi = kc.makeApiClient(k8s.RbacAuthorizationV1Api);
+    k8sStorageApi = kc.makeApiClient(k8s.StorageV1Api);
     return true;
   } catch (error) {
     console.error("Failed to initialize Kubernetes client:", error.message);
@@ -519,6 +522,43 @@ async function checkDaemonSetExists(name, namespace) {
     await k8sAppsApi.readNamespacedDaemonSet(name, namespace);
     return true;
   } catch (error) {
+    return false;
+  }
+}
+
+async function checkDefaultStorageClass() {
+  try {
+    const response = await k8sStorageApi.listStorageClass();
+    const storageClasses = response.body.items || [];
+
+    // Check if any StorageClass has the default annotation
+    const defaultSc = storageClasses.find(
+      (sc) =>
+        sc.metadata?.annotations?.[
+          "storageclass.kubernetes.io/is-default-class"
+        ] === "true" ||
+        sc.metadata?.annotations?.[
+          "storageclass.beta.kubernetes.io/is-default-class"
+        ] === "true",
+    );
+
+    if (defaultSc) {
+      console.log(`Found default StorageClass: ${defaultSc.metadata.name}`);
+      return true;
+    }
+
+    // If no default but at least one StorageClass exists, we can still try
+    if (storageClasses.length > 0) {
+      console.log(
+        `Found ${storageClasses.length} StorageClass(es), but none is default`,
+      );
+      return false;
+    }
+
+    console.log("No StorageClass found in cluster");
+    return false;
+  } catch (error) {
+    console.error("Error checking StorageClass:", error.message);
     return false;
   }
 }
@@ -598,6 +638,13 @@ async function applyManifest(manifestPath, namespace) {
             break;
 
           case "PersistentVolumeClaim":
+            // Skip PVC creation if no default StorageClass exists
+            if (!hasDefaultStorageClass) {
+              console.log(
+                `Skipping PVC '${name}' - no default StorageClass available`,
+              );
+              break;
+            }
             try {
               await k8sCoreApi.readNamespacedPersistentVolumeClaim(
                 name,
@@ -618,6 +665,22 @@ async function applyManifest(manifestPath, namespace) {
               await k8sAppsApi.readNamespacedDeployment(name, namespace);
               console.log(`Deployment '${name}' already exists`);
             } catch (e) {
+              // If no StorageClass and deployment uses PVC, switch to emptyDir
+              if (
+                !hasDefaultStorageClass &&
+                manifest.spec?.template?.spec?.volumes
+              ) {
+                manifest.spec.template.spec.volumes =
+                  manifest.spec.template.spec.volumes.map((vol) => {
+                    if (vol.persistentVolumeClaim) {
+                      console.log(
+                        `Converting PVC volume '${vol.name}' to emptyDir (no StorageClass)`,
+                      );
+                      return { name: vol.name, emptyDir: {} };
+                    }
+                    return vol;
+                  });
+              }
               await k8sAppsApi.createNamespacedDeployment(namespace, manifest);
               console.log(`Created Deployment '${name}'`);
             }
@@ -678,6 +741,14 @@ async function ensureMonitoringStack() {
   console.log(`\n========================================`);
   console.log(`Checking monitoring stack in namespace '${namespace}'...`);
   console.log(`========================================\n`);
+
+  // Check for default StorageClass
+  hasDefaultStorageClass = await checkDefaultStorageClass();
+  if (!hasDefaultStorageClass) {
+    console.log(
+      "WARNING: No default StorageClass - Victoria Metrics will use emptyDir (non-persistent)",
+    );
+  }
 
   // Ensure namespace exists
   await ensureNamespace(namespace);
