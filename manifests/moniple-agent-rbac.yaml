@@ -1,0 +1,65 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moniple-agent
+  namespace: moniple
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moniple-agent
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+rules:
+  # Namespace management
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "create"]
+  # Core resources for monitoring stack installation
+  - apiGroups: [""]
+    resources:
+      - serviceaccounts
+      - configmaps
+      - secrets
+      - services
+      - persistentvolumeclaims
+    verbs: ["get", "list", "create", "update", "patch"]
+  # Apps resources
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+    verbs: ["get", "list", "create", "update", "patch"]
+  # RBAC for creating kube-state-metrics and vmagent permissions
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterroles
+      - clusterrolebindings
+    verbs: ["get", "list", "create", "update", "patch"]
+  # Storage class check
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - storageclasses
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: moniple-agent
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: moniple-agent
+subjects:
+  - kind: ServiceAccount
+    name: moniple-agent
+    namespace: moniple
