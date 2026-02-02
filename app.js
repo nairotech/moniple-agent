@@ -759,8 +759,7 @@ const QUERIES = {
     "sum by (namespace,persistentvolumeclaim) (kube_persistentvolumeclaim_resource_requests_storage_bytes)",
 
   // Pod
-  POD_STATUS:
-    "sum by(exported_namespace,pod,phase) (kube_pod_status_phase > 0)",
+  POD_STATUS: "sum by(namespace,pod,phase) (kube_pod_status_phase > 0)",
   POD_CPU_USAGE:
     'sum by (pod,namespace) (rate(container_cpu_usage_seconds_total{pod!=""}[5m]))',
   POD_MEMORY_USAGE:
@@ -775,9 +774,13 @@ const QUERIES = {
   NODE_MEMORY_TOTAL:
     'sum by (node) (kube_node_status_allocatable{resource="memory"})',
   NODE_DISK_USAGE:
-    'max by (instance) ((node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay|tmpfs",mountpoint!~"/var/lib/kubelet.*"} - node_filesystem_avail_bytes{fstype=~"ext.?|xfs|overlay|tmpfs",mountpoint!~"/var/lib/kubelet.*"}) / node_filesystem_size_bytes{fstype=~"ext.?|xfs|overlay|tmpfs",mountpoint!~"/var/lib/kubelet.*"} * 100)',
+    'max by (instance) ((node_filesystem_size_bytes{fstype=~"ext.?|xfs",mountpoint="/"} - node_filesystem_avail_bytes{fstype=~"ext.?|xfs",mountpoint="/"}) / node_filesystem_size_bytes{fstype=~"ext.?|xfs",mountpoint="/"} * 100)',
+  NODE_DISK_USAGE_CADVISOR:
+    'max by (instance) (container_fs_usage_bytes{id="/",device=~"/dev/.*"} / container_fs_limit_bytes{id="/",device=~"/dev/.*"} * 100)',
   NODE_DISK_TOTAL:
     'sum by (node) (kube_node_status_allocatable{resource="ephemeral_storage"})',
+  NODE_DISK_TOTAL_CADVISOR:
+    'max by (instance) (container_fs_limit_bytes{id="/",device=~"/dev/.*"})',
   NODE_CPU_USAGE:
     '(1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100',
   NODE_CPU_TOTAL:
@@ -912,8 +915,7 @@ app.get("/metrics/pod", async (req, res) => {
     ]);
 
     const pods = statusData.map((item) => {
-      // kube-state-metrics uses exported_namespace for namespace, but pod for pod name
-      const namespace = item.metric.exported_namespace || item.metric.namespace;
+      const namespace = item.metric.namespace;
       const podName = item.metric.pod;
 
       // CPU (cAdvisor uses namespace/pod labels - match by pod name since namespace might differ)
@@ -1029,7 +1031,9 @@ app.get("/metrics/node", async (req, res) => {
       memUsage,
       memTotal,
       diskUsage,
+      diskUsageCadvisor,
       diskTotal,
+      diskTotalCadvisor,
       cpuUsage,
       cpuTotal,
       podUsage,
@@ -1040,12 +1044,20 @@ app.get("/metrics/node", async (req, res) => {
       queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
       queryPrometheus(QUERIES.NODE_MEMORY_TOTAL),
       queryPrometheus(QUERIES.NODE_DISK_USAGE),
+      queryPrometheus(QUERIES.NODE_DISK_USAGE_CADVISOR),
       queryPrometheus(QUERIES.NODE_DISK_TOTAL),
+      queryPrometheus(QUERIES.NODE_DISK_TOTAL_CADVISOR),
       queryPrometheus(QUERIES.NODE_CPU_USAGE),
       queryPrometheus(QUERIES.NODE_CPU_TOTAL),
       queryPrometheus(QUERIES.NODE_POD_USAGE),
       queryPrometheus(QUERIES.NODE_POD_TOTAL),
     ]);
+
+    // Use node_filesystem metrics if available, otherwise fallback to cadvisor
+    // Important: both usage and total must come from the same source for consistency
+    const useCadvisorDisk = diskUsage.length === 0;
+    const effectiveDiskUsage = useCadvisorDisk ? diskUsageCadvisor : diskUsage;
+    const effectiveDiskTotal = useCadvisorDisk ? diskTotalCadvisor : diskTotal;
 
     // Prefer node_uname_info (node-exporter), fallback to kube_node_info
     const nodeInfo =
@@ -1068,11 +1080,22 @@ app.get("/metrics/node", async (req, res) => {
         ? formatBytes(memTotalItem.value[1])
         : { value: 0, unit: "GiB" };
 
-      // Disk
-      const diskUsageItem = diskUsage.find(
-        (d) => d.metric.instance === instance,
+      // Disk (try node_filesystem first, fallback to cadvisor)
+      // node_filesystem uses instance like "192.168.65.3:9100"
+      // cadvisor uses instance as hostname like "docker-desktop" or kubernetes_io_hostname
+      const diskUsageItem = effectiveDiskUsage.find(
+        (d) =>
+          d.metric.instance === instance ||
+          d.metric.instance === nodeName ||
+          d.metric.kubernetes_io_hostname === nodeName,
       );
-      const diskTotalItem = diskTotal.find((d) => d.metric.node === nodeName);
+      const diskTotalItem = effectiveDiskTotal.find(
+        (d) =>
+          d.metric.node === nodeName ||
+          d.metric.instance === instance ||
+          d.metric.instance === nodeName ||
+          d.metric.kubernetes_io_hostname === nodeName,
+      );
       const diskUsagePercent = diskUsageItem
         ? round(parseFloat(diskUsageItem.value[1]))
         : 0;
@@ -1225,6 +1248,7 @@ app.get("/metrics/overview", async (req, res) => {
       memUsage,
       cpuUsage,
       diskUsage,
+      diskUsageCadvisor,
       podUsage,
       podStatus,
       alerts,
@@ -1233,10 +1257,15 @@ app.get("/metrics/overview", async (req, res) => {
       queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
       queryPrometheus(QUERIES.NODE_CPU_USAGE),
       queryPrometheus(QUERIES.NODE_DISK_USAGE),
+      queryPrometheus(QUERIES.NODE_DISK_USAGE_CADVISOR),
       queryPrometheus(QUERIES.NODE_POD_USAGE),
       queryPrometheus(QUERIES.POD_STATUS),
       fetchAlerts(),
     ]);
+
+    // Use node_filesystem metrics if available, otherwise fallback to cadvisor
+    const effectiveDiskUsage =
+      diskUsage.length > 0 ? diskUsage : diskUsageCadvisor;
 
     const nodeCount = nodeInfo.length || 1;
 
@@ -1256,10 +1285,12 @@ app.get("/metrics/overview", async (req, res) => {
           )
         : 0;
     const avgDisk =
-      diskUsage.length > 0
+      effectiveDiskUsage.length > 0
         ? round(
-            diskUsage.reduce((sum, d) => sum + parseFloat(d.value[1] || 0), 0) /
-              diskUsage.length,
+            effectiveDiskUsage.reduce(
+              (sum, d) => sum + parseFloat(d.value[1] || 0),
+              0,
+            ) / effectiveDiskUsage.length,
           )
         : 0;
     const avgPod =
@@ -1325,16 +1356,29 @@ app.get("/metrics/overview", async (req, res) => {
 
 // Internal functions to get metrics data (reuse endpoint logic)
 async function getOverviewData() {
-  const [nodeInfo, memUsage, cpuUsage, diskUsage, podUsage, podStatus, alerts] =
-    await Promise.all([
-      queryPrometheus(QUERIES.NODE_INFO),
-      queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
-      queryPrometheus(QUERIES.NODE_CPU_USAGE),
-      queryPrometheus(QUERIES.NODE_DISK_USAGE),
-      queryPrometheus(QUERIES.NODE_POD_USAGE),
-      queryPrometheus(QUERIES.POD_STATUS),
-      fetchAlerts(),
-    ]);
+  const [
+    nodeInfo,
+    memUsage,
+    cpuUsage,
+    diskUsage,
+    diskUsageCadvisor,
+    podUsage,
+    podStatus,
+    alerts,
+  ] = await Promise.all([
+    queryPrometheus(QUERIES.NODE_INFO),
+    queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
+    queryPrometheus(QUERIES.NODE_CPU_USAGE),
+    queryPrometheus(QUERIES.NODE_DISK_USAGE),
+    queryPrometheus(QUERIES.NODE_DISK_USAGE_CADVISOR),
+    queryPrometheus(QUERIES.NODE_POD_USAGE),
+    queryPrometheus(QUERIES.POD_STATUS),
+    fetchAlerts(),
+  ]);
+
+  // Use node_filesystem metrics if available, otherwise fallback to cadvisor
+  const effectiveDiskUsage =
+    diskUsage.length > 0 ? diskUsage : diskUsageCadvisor;
 
   const nodeCount = nodeInfo.length || 1;
   const avgCpu =
@@ -1352,10 +1396,12 @@ async function getOverviewData() {
         )
       : 0;
   const avgDisk =
-    diskUsage.length > 0
+    effectiveDiskUsage.length > 0
       ? round(
-          diskUsage.reduce((sum, d) => sum + parseFloat(d.value[1] || 0), 0) /
-            diskUsage.length,
+          effectiveDiskUsage.reduce(
+            (sum, d) => sum + parseFloat(d.value[1] || 0),
+            0,
+          ) / effectiveDiskUsage.length,
         )
       : 0;
   const avgPod =
