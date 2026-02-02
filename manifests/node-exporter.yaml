@@ -61,6 +61,10 @@ spec:
       tolerations:
         - operator: Exists
           effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+        - operator: Exists
+          effect: PreferNoSchedule
       volumes:
         - name: proc
           hostPath:

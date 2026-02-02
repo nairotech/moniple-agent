@@ -526,6 +526,42 @@ async function checkDaemonSetExists(name, namespace) {
   }
 }
 
+async function checkExistingNodeExporter() {
+  try {
+    // Check if node-exporter metrics are already available (from any source)
+    const url = `${CONFIG.apiUrl}/query?query=node_cpu_seconds_total`;
+    const response = await fetch(url);
+    const data = await response.json();
+    if (data.status === "success" && data.data?.result?.length > 0) {
+      console.log("Node-exporter metrics already available in cluster");
+      return true;
+    }
+  } catch (e) {
+    // Ignore errors, will check DaemonSet
+  }
+
+  try {
+    // Check for node-exporter DaemonSet in any namespace
+    const response = await k8sAppsApi.listDaemonSetForAllNamespaces();
+    const daemonSets = response.body.items || [];
+    const existingNodeExporter = daemonSets.find(
+      (ds) =>
+        ds.metadata?.name?.includes("node-exporter") ||
+        ds.metadata?.labels?.app?.includes("node-exporter"),
+    );
+    if (existingNodeExporter) {
+      console.log(
+        `Found existing node-exporter: ${existingNodeExporter.metadata.name} in ${existingNodeExporter.metadata.namespace}`,
+      );
+      return true;
+    }
+  } catch (e) {
+    console.log("Could not check for existing node-exporter DaemonSets");
+  }
+
+  return false;
+}
+
 async function checkDefaultStorageClass() {
   try {
     const response = await k8sStorageApi.listStorageClass();
@@ -788,16 +824,23 @@ async function ensureMonitoringStack() {
     console.log("kube-state-metrics already installed");
   }
 
-  // Check and install node-exporter
-  const neExists = await checkDaemonSetExists("node-exporter", namespace);
-  if (!neExists) {
-    console.log("\n--- Installing node-exporter ---");
-    await applyManifest(
-      path.join(manifestsDir, "node-exporter.yaml"),
-      namespace,
-    );
+  // Check and install node-exporter (skip if already exists anywhere in cluster)
+  const existingNodeExporter = await checkExistingNodeExporter();
+  if (!existingNodeExporter) {
+    const neExists = await checkDaemonSetExists("node-exporter", namespace);
+    if (!neExists) {
+      console.log("\n--- Installing node-exporter ---");
+      await applyManifest(
+        path.join(manifestsDir, "node-exporter.yaml"),
+        namespace,
+      );
+    } else {
+      console.log("node-exporter already installed in moniple namespace");
+    }
   } else {
-    console.log("node-exporter already installed");
+    console.log(
+      "Skipping node-exporter installation - already exists in cluster",
+    );
   }
 
   // Update Prometheus API URL to point to local vmsingle if not set
