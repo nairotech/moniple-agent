@@ -530,14 +530,17 @@ async function checkExistingNodeExporter() {
   try {
     // Check if node-exporter metrics are already available (from any source)
     const url = `${CONFIG.apiUrl}/query?query=node_cpu_seconds_total`;
-    const response = await fetch(url);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
     const data = await response.json();
     if (data.status === "success" && data.data?.result?.length > 0) {
       console.log("Node-exporter metrics already available in cluster");
       return true;
     }
   } catch (e) {
-    // Ignore errors, will check DaemonSet
+    // Ignore errors (timeout or connection refused), will check DaemonSet
   }
 
   try {
