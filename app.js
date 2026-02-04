@@ -702,26 +702,38 @@ async function applyManifest(manifestPath, namespace) {
           case "ClusterRole":
             try {
               await k8sRbacApi.readClusterRole(name);
-              console.log(`ClusterRole '${name}' already exists`);
+              // Update existing ClusterRole
+              await k8sRbacApi.replaceClusterRole(name, manifest);
+              console.log(`Updated ClusterRole '${name}'`);
             } catch (e) {
-              await k8sRbacApi.createClusterRole(manifest);
-              console.log(`Created ClusterRole '${name}'`);
+              if (e.statusCode === 404 || e.response?.statusCode === 404) {
+                await k8sRbacApi.createClusterRole(manifest);
+                console.log(`Created ClusterRole '${name}'`);
+              } else {
+                throw e;
+              }
             }
             break;
 
           case "ClusterRoleBinding":
+            // Update namespace in subjects
+            if (manifest.subjects) {
+              manifest.subjects.forEach((s) => {
+                if (s.namespace) s.namespace = namespace;
+              });
+            }
             try {
               await k8sRbacApi.readClusterRoleBinding(name);
-              console.log(`ClusterRoleBinding '${name}' already exists`);
+              // Update existing ClusterRoleBinding
+              await k8sRbacApi.replaceClusterRoleBinding(name, manifest);
+              console.log(`Updated ClusterRoleBinding '${name}'`);
             } catch (e) {
-              // Update namespace in subjects
-              if (manifest.subjects) {
-                manifest.subjects.forEach((s) => {
-                  if (s.namespace) s.namespace = namespace;
-                });
+              if (e.statusCode === 404 || e.response?.statusCode === 404) {
+                await k8sRbacApi.createClusterRoleBinding(manifest);
+                console.log(`Created ClusterRoleBinding '${name}'`);
+              } else {
+                throw e;
               }
-              await k8sRbacApi.createClusterRoleBinding(manifest);
-              console.log(`Created ClusterRoleBinding '${name}'`);
             }
             break;
 
@@ -729,7 +741,14 @@ async function applyManifest(manifestPath, namespace) {
             console.log(`Skipping unsupported kind: ${kind}`);
         }
       } catch (applyError) {
+        const errorBody = applyError.response?.body || applyError.body || {};
         console.error(`Error applying ${kind} '${name}':`, applyError.message);
+        if (errorBody.message) {
+          console.error(`  Reason: ${errorBody.message}`);
+        }
+        if (errorBody.reason) {
+          console.error(`  Reason code: ${errorBody.reason}`);
+        }
       }
     }
     return true;
