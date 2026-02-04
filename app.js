@@ -765,15 +765,27 @@ async function ensureMonitoringStack() {
   }
 
   // Check and install Victoria Metrics (moniple-prefixed)
-  const vmExists = await checkDeploymentExists("moniple-vmsingle", namespace);
-  if (!vmExists) {
+  // Check both vmsingle and vmagent - if either is missing, apply the manifest
+  const vmsingleExists = await checkDeploymentExists(
+    "moniple-vmsingle",
+    namespace,
+  );
+  const vmagentExists = await checkDeploymentExists(
+    "moniple-vmagent",
+    namespace,
+  );
+  if (!vmsingleExists || !vmagentExists) {
     console.log("\n--- Installing Moniple Victoria Metrics ---");
+    if (!vmsingleExists) console.log("  - moniple-vmsingle not found");
+    if (!vmagentExists) console.log("  - moniple-vmagent not found");
     await applyManifest(
       path.join(manifestsDir, "victoria-metrics.yaml"),
       namespace,
     );
   } else {
-    console.log("Moniple Victoria Metrics already installed");
+    console.log(
+      "Moniple Victoria Metrics already installed (vmsingle + vmagent)",
+    );
   }
 
   // Check and install kube-state-metrics (moniple-prefixed)
