@@ -2,30 +2,30 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: node-exporter
+  name: moniple-node-exporter
   namespace: moniple
   labels:
-    app: node-exporter
+    app: moniple-node-exporter
     managed-by: moniple-agent
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: node-exporter
+  name: moniple-node-exporter
   namespace: moniple
   labels:
-    app: node-exporter
+    app: moniple-node-exporter
     managed-by: moniple-agent
 spec:
   selector:
     matchLabels:
-      app: node-exporter
+      app: moniple-node-exporter
   template:
     metadata:
       labels:
-        app: node-exporter
+        app: moniple-node-exporter
     spec:
-      serviceAccountName: node-exporter
+      serviceAccountName: moniple-node-exporter
       hostNetwork: true
       hostPID: true
       containers:
@@ -34,12 +34,12 @@ spec:
           args:
             - --path.procfs=/host/proc
             - --path.sysfs=/host/sys
-            - --web.listen-address=:9100
+            - --web.listen-address=:9101
             - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|var/lib/kubelet/.+|boot|snap)($|/)
             - --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs|tmpfs)$
           ports:
-            - containerPort: 9100
-              hostPort: 9100
+            - containerPort: 9101
+              hostPort: 9101
               name: metrics
           volumeMounts:
             - name: proc
@@ -76,20 +76,20 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: node-exporter
+  name: moniple-node-exporter
   namespace: moniple
   labels:
-    app: node-exporter
+    app: moniple-node-exporter
     managed-by: moniple-agent
   annotations:
     prometheus.io/scrape: "true"
-    prometheus.io/port: "9100"
+    prometheus.io/port: "9101"
 spec:
   type: ClusterIP
   clusterIP: None
   ports:
-    - port: 9100
+    - port: 9101
       targetPort: metrics
       name: metrics
   selector:
-    app: node-exporter
+    app: moniple-node-exporter

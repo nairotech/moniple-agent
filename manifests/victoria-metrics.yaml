@@ -2,10 +2,10 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: vmsingle-data
+  name: moniple-vmsingle-data
   namespace: moniple
   labels:
-    app: vmsingle
+    app: moniple-vmsingle
     managed-by: moniple-agent
 spec:
   accessModes:
@@ -17,20 +17,20 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vmsingle
+  name: moniple-vmsingle
   namespace: moniple
   labels:
-    app: vmsingle
+    app: moniple-vmsingle
     managed-by: moniple-agent
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: vmsingle
+      app: moniple-vmsingle
   template:
     metadata:
       labels:
-        app: vmsingle
+        app: moniple-vmsingle
     spec:
       containers:
         - name: vmsingle
@@ -67,15 +67,15 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: vmsingle-data
+            claimName: moniple-vmsingle-data
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: vmsingle
+  name: moniple-vmsingle
   namespace: moniple
   labels:
-    app: vmsingle
+    app: moniple-vmsingle
     managed-by: moniple-agent
 spec:
   type: ClusterIP
@@ -84,15 +84,15 @@ spec:
       targetPort: 8428
       name: http
   selector:
-    app: vmsingle
+    app: moniple-vmsingle
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: vmagent-config
+  name: moniple-vmagent-config
   namespace: moniple
   labels:
-    app: vmagent
+    app: moniple-vmagent
     managed-by: moniple-agent
 data:
   scrape.yaml: |
@@ -101,24 +101,15 @@ data:
       scrape_timeout: 10s
 
     scrape_configs:
-      - job_name: kube-state-metrics
+      - job_name: moniple-kube-state-metrics
         static_configs:
           - targets:
-              - kube-state-metrics.moniple.svc:8080
+              - moniple-kube-state-metrics.moniple.svc:8080
 
-      - job_name: node-exporter
-        kubernetes_sd_configs:
-          - role: endpoints
-            namespaces:
-              names:
-                - moniple
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_service_name]
-            regex: node-exporter
-            action: keep
-          - source_labels: [__meta_kubernetes_endpoint_port_name]
-            regex: metrics
-            action: keep
+      - job_name: moniple-node-exporter
+        static_configs:
+          - targets:
+              - moniple-node-exporter.moniple.svc:9101
 
       - job_name: kubelet
         scheme: https
@@ -159,18 +150,18 @@ data:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: vmagent
+  name: moniple-vmagent
   namespace: moniple
   labels:
-    app: vmagent
+    app: moniple-vmagent
     managed-by: moniple-agent
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: vmagent
+  name: moniple-vmagent
   labels:
-    app: vmagent
+    app: moniple-vmagent
     managed-by: moniple-agent
 rules:
   - apiGroups: [""]
@@ -192,44 +183,44 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: vmagent
+  name: moniple-vmagent
   labels:
-    app: vmagent
+    app: moniple-vmagent
     managed-by: moniple-agent
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: vmagent
+  name: moniple-vmagent
 subjects:
   - kind: ServiceAccount
-    name: vmagent
+    name: moniple-vmagent
     namespace: moniple
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vmagent
+  name: moniple-vmagent
   namespace: moniple
   labels:
-    app: vmagent
+    app: moniple-vmagent
     managed-by: moniple-agent
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: vmagent
+      app: moniple-vmagent
   template:
     metadata:
       labels:
-        app: vmagent
+        app: moniple-vmagent
     spec:
-      serviceAccountName: vmagent
+      serviceAccountName: moniple-vmagent
       containers:
         - name: vmagent
           image: victoriametrics/vmagent:v1.96.0
           args:
             - -promscrape.config=/config/scrape.yaml
-            - -remoteWrite.url=http://vmsingle.moniple.svc:8428/api/v1/write
+            - -remoteWrite.url=http://moniple-vmsingle.moniple.svc:8428/api/v1/write
           ports:
             - containerPort: 8429
               name: http
@@ -246,4 +237,4 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: vmagent-config
+            name: moniple-vmagent-config

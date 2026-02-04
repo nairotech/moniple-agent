@@ -526,44 +526,8 @@ async function checkDaemonSetExists(name, namespace) {
   }
 }
 
-async function checkExistingNodeExporter() {
-  try {
-    // Check if node-exporter metrics are already available (from any source)
-    const url = `${CONFIG.apiUrl}/query?query=node_cpu_seconds_total`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-    const data = await response.json();
-    if (data.status === "success" && data.data?.result?.length > 0) {
-      console.log("Node-exporter metrics already available in cluster");
-      return true;
-    }
-  } catch (e) {
-    // Ignore errors (timeout or connection refused), will check DaemonSet
-  }
-
-  try {
-    // Check for node-exporter DaemonSet in any namespace
-    const response = await k8sAppsApi.listDaemonSetForAllNamespaces();
-    const daemonSets = response.body.items || [];
-    const existingNodeExporter = daemonSets.find(
-      (ds) =>
-        ds.metadata?.name?.includes("node-exporter") ||
-        ds.metadata?.labels?.app?.includes("node-exporter"),
-    );
-    if (existingNodeExporter) {
-      console.log(
-        `Found existing node-exporter: ${existingNodeExporter.metadata.name} in ${existingNodeExporter.metadata.namespace}`,
-      );
-      return true;
-    }
-  } catch (e) {
-    console.log("Could not check for existing node-exporter DaemonSets");
-  }
-
-  return false;
-}
+// Note: checkExistingNodeExporter removed - we always install moniple-node-exporter
+// on port 9101 to avoid conflicts with existing node-exporters on port 9100
 
 async function checkDefaultStorageClass() {
   try {
@@ -800,55 +764,51 @@ async function ensureMonitoringStack() {
     return;
   }
 
-  // Check and install Victoria Metrics
-  const vmExists = await checkDeploymentExists("vmsingle", namespace);
+  // Check and install Victoria Metrics (moniple-prefixed)
+  const vmExists = await checkDeploymentExists("moniple-vmsingle", namespace);
   if (!vmExists) {
-    console.log("\n--- Installing Victoria Metrics ---");
+    console.log("\n--- Installing Moniple Victoria Metrics ---");
     await applyManifest(
       path.join(manifestsDir, "victoria-metrics.yaml"),
       namespace,
     );
   } else {
-    console.log("Victoria Metrics already installed");
+    console.log("Moniple Victoria Metrics already installed");
   }
 
-  // Check and install kube-state-metrics
+  // Check and install kube-state-metrics (moniple-prefixed)
   const ksmExists = await checkDeploymentExists(
-    "kube-state-metrics",
+    "moniple-kube-state-metrics",
     namespace,
   );
   if (!ksmExists) {
-    console.log("\n--- Installing kube-state-metrics ---");
+    console.log("\n--- Installing Moniple kube-state-metrics ---");
     await applyManifest(
       path.join(manifestsDir, "kube-state-metrics.yaml"),
       namespace,
     );
   } else {
-    console.log("kube-state-metrics already installed");
+    console.log("Moniple kube-state-metrics already installed");
   }
 
-  // Check and install node-exporter (skip if already exists anywhere in cluster)
-  const existingNodeExporter = await checkExistingNodeExporter();
-  if (!existingNodeExporter) {
-    const neExists = await checkDaemonSetExists("node-exporter", namespace);
-    if (!neExists) {
-      console.log("\n--- Installing node-exporter ---");
-      await applyManifest(
-        path.join(manifestsDir, "node-exporter.yaml"),
-        namespace,
-      );
-    } else {
-      console.log("node-exporter already installed in moniple namespace");
-    }
-  } else {
-    console.log(
-      "Skipping node-exporter installation - already exists in cluster",
+  // Check and install node-exporter (moniple-prefixed, uses port 9101 to avoid conflicts)
+  const neExists = await checkDaemonSetExists(
+    "moniple-node-exporter",
+    namespace,
+  );
+  if (!neExists) {
+    console.log("\n--- Installing Moniple node-exporter (port 9101) ---");
+    await applyManifest(
+      path.join(manifestsDir, "node-exporter.yaml"),
+      namespace,
     );
+  } else {
+    console.log("Moniple node-exporter already installed");
   }
 
-  // Update Prometheus API URL to point to local vmsingle if not set
+  // Update Prometheus API URL to point to local moniple-vmsingle if not set
   if (CONFIG.apiUrl === "http://prometheus:9090/api/v1") {
-    CONFIG.apiUrl = `http://vmsingle.${namespace}.svc:8428/api/v1`;
+    CONFIG.apiUrl = `http://moniple-vmsingle.${namespace}.svc:8428/api/v1`;
     console.log(`\nUpdated PROMETHEUS_API_URL to: ${CONFIG.apiUrl}`);
   }
 
