@@ -523,6 +523,90 @@ async function checkDaemonSetExists(name, namespace) {
   }
 }
 
+async function checkClusterRoleExists(name) {
+  try {
+    await k8sRbacApi.readClusterRole(name);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function ensureRbacFromManifest(manifestPath, namespace) {
+  // Apply only RBAC resources (ClusterRole, ClusterRoleBinding, ServiceAccount) from manifest
+  try {
+    const fileContent = fs.readFileSync(manifestPath, "utf8");
+    const manifests = yaml.loadAll(fileContent);
+
+    for (const manifest of manifests) {
+      if (!manifest) continue;
+
+      const kind = manifest.kind;
+      const name = manifest.metadata?.name;
+
+      if (
+        !["ClusterRole", "ClusterRoleBinding", "ServiceAccount"].includes(kind)
+      ) {
+        continue;
+      }
+
+      // Override namespace for ServiceAccount
+      if (kind === "ServiceAccount" && manifest.metadata) {
+        manifest.metadata.namespace = namespace;
+      }
+
+      switch (kind) {
+        case "ServiceAccount":
+          try {
+            await k8sCoreApi.readNamespacedServiceAccount(name, namespace);
+          } catch (e) {
+            if (e.statusCode === 404 || e.response?.statusCode === 404) {
+              await k8sCoreApi.createNamespacedServiceAccount(
+                namespace,
+                manifest,
+              );
+              console.log(`Created ServiceAccount '${name}'`);
+            }
+          }
+          break;
+
+        case "ClusterRole":
+          try {
+            await k8sRbacApi.readClusterRole(name);
+            await k8sRbacApi.replaceClusterRole(name, manifest);
+            console.log(`Updated ClusterRole '${name}'`);
+          } catch (e) {
+            if (e.statusCode === 404 || e.response?.statusCode === 404) {
+              await k8sRbacApi.createClusterRole(manifest);
+              console.log(`Created ClusterRole '${name}'`);
+            }
+          }
+          break;
+
+        case "ClusterRoleBinding":
+          if (manifest.subjects) {
+            manifest.subjects.forEach((s) => {
+              if (s.namespace) s.namespace = namespace;
+            });
+          }
+          try {
+            await k8sRbacApi.readClusterRoleBinding(name);
+            await k8sRbacApi.replaceClusterRoleBinding(name, manifest);
+            console.log(`Updated ClusterRoleBinding '${name}'`);
+          } catch (e) {
+            if (e.statusCode === 404 || e.response?.statusCode === 404) {
+              await k8sRbacApi.createClusterRoleBinding(manifest);
+              console.log(`Created ClusterRoleBinding '${name}'`);
+            }
+          }
+          break;
+      }
+    }
+  } catch (error) {
+    console.error(`Error ensuring RBAC from ${manifestPath}:`, error.message);
+  }
+}
+
 // Note: checkExistingNodeExporter removed - we always install moniple-node-exporter
 // on port 9101 to avoid conflicts with existing node-exporters on port 9100
 
@@ -706,11 +790,21 @@ async function ensureMonitoringStack() {
     "moniple-vmagent",
     namespace,
   );
+  const vmagentRbacExists = await checkClusterRoleExists("moniple-vmagent");
   if (!vmsingleExists || !vmagentExists) {
     console.log("\n--- Installing Moniple Victoria Metrics ---");
     if (!vmsingleExists) console.log("  - moniple-vmsingle not found");
     if (!vmagentExists) console.log("  - moniple-vmagent not found");
     await applyManifest(
+      path.join(manifestsDir, "victoria-metrics.yaml"),
+      namespace,
+    );
+  } else if (!vmagentRbacExists) {
+    // Deployments exist but RBAC is missing - apply RBAC only
+    console.log(
+      "Moniple Victoria Metrics deployments exist, but vmagent RBAC missing - applying RBAC...",
+    );
+    await ensureRbacFromManifest(
       path.join(manifestsDir, "victoria-metrics.yaml"),
       namespace,
     );
@@ -725,9 +819,21 @@ async function ensureMonitoringStack() {
     "moniple-kube-state-metrics",
     namespace,
   );
+  const ksmRbacExists = await checkClusterRoleExists(
+    "moniple-kube-state-metrics",
+  );
   if (!ksmExists) {
     console.log("\n--- Installing Moniple kube-state-metrics ---");
     await applyManifest(
+      path.join(manifestsDir, "kube-state-metrics.yaml"),
+      namespace,
+    );
+  } else if (!ksmRbacExists) {
+    // Deployment exists but RBAC is missing - apply RBAC only
+    console.log(
+      "Moniple kube-state-metrics deployment exists, but RBAC missing - applying RBAC...",
+    );
+    await ensureRbacFromManifest(
       path.join(manifestsDir, "kube-state-metrics.yaml"),
       namespace,
     );
