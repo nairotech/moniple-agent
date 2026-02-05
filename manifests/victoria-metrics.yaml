@@ -1,19 +1,7 @@
 ---
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: moniple-vmsingle-data
-  namespace: moniple
-  labels:
-    app: moniple-vmsingle
-    managed-by: moniple-agent
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
----
+# Victoria Metrics Single - Ephemeral storage (emptyDir)
+# Data is NOT persisted across pod restarts
+# For production with persistence, deploy Victoria Metrics separately with PVC
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,7 +25,7 @@ spec:
           image: victoriametrics/victoria-metrics:v1.96.0
           args:
             - -storageDataPath=/storage
-            - -retentionPeriod=30d
+            - -retentionPeriod=7d
             - -httpListenAddr=:8428
           ports:
             - containerPort: 8428
@@ -66,8 +54,8 @@ spec:
             periodSeconds: 5
       volumes:
         - name: data
-          persistentVolumeClaim:
-            claimName: moniple-vmsingle-data
+          emptyDir:
+            sizeLimit: 5Gi
 ---
 apiVersion: v1
 kind: Service
