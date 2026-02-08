@@ -576,9 +576,19 @@ async function ensureRbacFromManifest(manifestPath, namespace) {
             await k8sRbacApi.replaceClusterRole(name, manifest);
             console.log(`Updated ClusterRole '${name}'`);
           } catch (e) {
-            if (e.statusCode === 404 || e.response?.statusCode === 404) {
+            try {
               await k8sRbacApi.createClusterRole(manifest);
               console.log(`Created ClusterRole '${name}'`);
+            } catch (createErr) {
+              if (
+                createErr.statusCode !== 409 &&
+                createErr.response?.statusCode !== 409
+              ) {
+                console.error(
+                  `Error creating ClusterRole '${name}':`,
+                  createErr.message,
+                );
+              }
             }
           }
           break;
@@ -594,9 +604,19 @@ async function ensureRbacFromManifest(manifestPath, namespace) {
             await k8sRbacApi.replaceClusterRoleBinding(name, manifest);
             console.log(`Updated ClusterRoleBinding '${name}'`);
           } catch (e) {
-            if (e.statusCode === 404 || e.response?.statusCode === 404) {
+            try {
               await k8sRbacApi.createClusterRoleBinding(manifest);
               console.log(`Created ClusterRoleBinding '${name}'`);
+            } catch (createErr) {
+              if (
+                createErr.statusCode !== 409 &&
+                createErr.response?.statusCode !== 409
+              ) {
+                console.error(
+                  `Error creating ClusterRoleBinding '${name}':`,
+                  createErr.message,
+                );
+              }
             }
           }
           break;
@@ -707,15 +727,21 @@ async function applyManifest(manifestPath, namespace) {
           case "ClusterRole":
             try {
               await k8sRbacApi.readClusterRole(name);
-              // Update existing ClusterRole
               await k8sRbacApi.replaceClusterRole(name, manifest);
               console.log(`Updated ClusterRole '${name}'`);
             } catch (e) {
-              if (e.statusCode === 404 || e.response?.statusCode === 404) {
+              try {
                 await k8sRbacApi.createClusterRole(manifest);
                 console.log(`Created ClusterRole '${name}'`);
-              } else {
-                throw e;
+              } catch (createErr) {
+                if (
+                  createErr.statusCode === 409 ||
+                  createErr.response?.statusCode === 409
+                ) {
+                  console.log(`ClusterRole '${name}' already exists`);
+                } else {
+                  throw createErr;
+                }
               }
             }
             break;
@@ -729,15 +755,21 @@ async function applyManifest(manifestPath, namespace) {
             }
             try {
               await k8sRbacApi.readClusterRoleBinding(name);
-              // Update existing ClusterRoleBinding
               await k8sRbacApi.replaceClusterRoleBinding(name, manifest);
               console.log(`Updated ClusterRoleBinding '${name}'`);
             } catch (e) {
-              if (e.statusCode === 404 || e.response?.statusCode === 404) {
+              try {
                 await k8sRbacApi.createClusterRoleBinding(manifest);
                 console.log(`Created ClusterRoleBinding '${name}'`);
-              } else {
-                throw e;
+              } catch (createErr) {
+                if (
+                  createErr.statusCode === 409 ||
+                  createErr.response?.statusCode === 409
+                ) {
+                  console.log(`ClusterRoleBinding '${name}' already exists`);
+                } else {
+                  throw createErr;
+                }
               }
             }
             break;
