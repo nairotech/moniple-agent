@@ -16,37 +16,103 @@ metadata:
     app: moniple-agent
     managed-by: moniple-agent
 rules:
-  # Namespace management
+  # Core resources - agent install + kube-state-metrics delegation
   - apiGroups: [""]
     resources:
       - namespaces
-    verbs: ["get", "list", "create"]
-  # Core resources for monitoring stack installation
-  - apiGroups: [""]
-    resources:
+      - nodes
+      - nodes/proxy
+      - nodes/metrics
+      - pods
+      - services
+      - endpoints
       - serviceaccounts
       - configmaps
       - secrets
-      - services
       - persistentvolumeclaims
-    verbs: ["get", "list", "create", "update", "patch"]
+      - persistentvolumes
+      - resourcequotas
+      - replicationcontrollers
+      - limitranges
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   # Apps resources
   - apiGroups: ["apps"]
     resources:
       - deployments
       - daemonsets
-    verbs: ["get", "list", "create", "update", "patch"]
-  # RBAC for creating kube-state-metrics and vmagent permissions
+      - replicasets
+      - statefulsets
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Batch resources (kube-state-metrics needs)
+  - apiGroups: ["batch"]
+    resources:
+      - cronjobs
+      - jobs
+    verbs: ["list", "watch"]
+  # Autoscaling (kube-state-metrics needs)
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["list", "watch"]
+  # Auth (kube-state-metrics needs)
+  - apiGroups: ["authentication.k8s.io"]
+    resources:
+      - tokenreviews
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources:
+      - subjectaccessreviews
+    verbs: ["create"]
+  # Policy (kube-state-metrics needs)
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["list", "watch"]
+  # Certificates (kube-state-metrics needs)
+  - apiGroups: ["certificates.k8s.io"]
+    resources:
+      - certificatesigningrequests
+    verbs: ["list", "watch"]
+  # Discovery (kube-state-metrics needs)
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["list", "watch"]
+  # Storage (kube-state-metrics needs)
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - storageclasses
+      - volumeattachments
+    verbs: ["get", "list", "watch"]
+  # Admission (kube-state-metrics needs)
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources:
+      - mutatingwebhookconfigurations
+      - validatingwebhookconfigurations
+    verbs: ["list", "watch"]
+  # Networking (kube-state-metrics needs)
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - networkpolicies
+      - ingressclasses
+      - ingresses
+    verbs: ["list", "watch"]
+  # Coordination (kube-state-metrics needs)
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs: ["list", "watch"]
+  # RBAC management - agent creates roles for kube-state-metrics and vmagent
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources:
       - clusterroles
       - clusterrolebindings
-    verbs: ["get", "list", "create", "update", "patch"]
-  # Storage class check
-  - apiGroups: ["storage.k8s.io"]
-    resources:
-      - storageclasses
-    verbs: ["get", "list"]
+      - roles
+      - rolebindings
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Metrics endpoints (vmagent scraping)
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
