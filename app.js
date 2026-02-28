@@ -1805,11 +1805,26 @@ async function getNodeData() {
 }
 
 async function getPodData() {
-  const [statusData, cpuData, memoryData] = await Promise.all([
-    queryPrometheus(QUERIES.POD_STATUS),
-    queryPrometheus(QUERIES.POD_CPU_USAGE),
-    queryPrometheus(QUERIES.POD_MEMORY_USAGE),
-  ]);
+  const [statusData, cpuData, memoryData, ownerData, rsOwnerData] =
+    await Promise.all([
+      queryPrometheus(QUERIES.POD_STATUS),
+      queryPrometheus(QUERIES.POD_CPU_USAGE),
+      queryPrometheus(QUERIES.POD_MEMORY_USAGE),
+      queryPrometheus(QUERIES.POD_OWNER),
+      queryPrometheus(QUERIES.RS_OWNER),
+    ]);
+
+  // Build ReplicaSet → Deployment lookup map
+  const rsToDeployment = {};
+  for (const rs of rsOwnerData) {
+    const ns = rs.metric.namespace;
+    const rsName = rs.metric.replicaset;
+    const ownerKind = rs.metric.owner_kind;
+    const ownerName = rs.metric.owner_name;
+    if (ownerKind === "Deployment" && rsName && ownerName) {
+      rsToDeployment[`${ns}/${rsName}`] = ownerName;
+    }
+  }
 
   const pods = statusData.map((item) => {
     const namespace = item.metric.exported_namespace || item.metric.namespace;
@@ -1825,10 +1840,42 @@ async function getPodData() {
       ? formatBytes(memItem.value[1])
       : { value: 0, unit: "bytes" };
 
+    // Owner resolution: Pod → ReplicaSet → Deployment, or Pod → StatefulSet/DaemonSet/Job
+    const ownerItem = ownerData.find(
+      (o) => o.metric.pod === podName && o.metric.namespace === namespace,
+    );
+    let podOwnerKind = null;
+    let podOwnerName = null;
+    if (ownerItem) {
+      const directKind = ownerItem.metric.owner_kind;
+      const directName = ownerItem.metric.owner_name;
+
+      if (directKind === "ReplicaSet") {
+        const deploymentName =
+          rsToDeployment[`${namespace}/${directName}`];
+        if (deploymentName) {
+          podOwnerKind = "Deployment";
+          podOwnerName = deploymentName;
+        } else {
+          podOwnerKind = "ReplicaSet";
+          podOwnerName = directName;
+        }
+      } else if (
+        directKind &&
+        directKind !== "<none>" &&
+        directKind !== "Node"
+      ) {
+        podOwnerKind = directKind;
+        podOwnerName = directName;
+      }
+    }
+
     return {
       namespace,
       name: podName,
       phase: item.metric.phase,
+      ownerKind: podOwnerKind,
+      ownerName: podOwnerName,
       cpu: { value: cpuCores, unit: "cores" },
       memory: { value: memory.value, unit: memory.unit },
     };
