@@ -933,6 +933,8 @@ const QUERIES = {
     'sum by (pod,namespace) (rate(container_cpu_usage_seconds_total{pod!=""}[5m]))',
   POD_MEMORY_USAGE:
     'sum by (pod,namespace) (container_memory_working_set_bytes{pod!=""})',
+  POD_OWNER: "kube_pod_owner",
+  RS_OWNER: "kube_replicaset_owner",
 
   // Node (use node_uname_info for correct instance, fallback to kube_node_info)
   NODE_INFO: "node_uname_info or kube_node_info",
@@ -1077,11 +1079,26 @@ app.get("/metrics/ns", async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get("/metrics/pod", async (req, res) => {
   try {
-    const [statusData, cpuData, memoryData] = await Promise.all([
-      queryPrometheus(QUERIES.POD_STATUS),
-      queryPrometheus(QUERIES.POD_CPU_USAGE),
-      queryPrometheus(QUERIES.POD_MEMORY_USAGE),
-    ]);
+    const [statusData, cpuData, memoryData, ownerData, rsOwnerData] =
+      await Promise.all([
+        queryPrometheus(QUERIES.POD_STATUS),
+        queryPrometheus(QUERIES.POD_CPU_USAGE),
+        queryPrometheus(QUERIES.POD_MEMORY_USAGE),
+        queryPrometheus(QUERIES.POD_OWNER),
+        queryPrometheus(QUERIES.RS_OWNER),
+      ]);
+
+    // Build ReplicaSet → Deployment lookup map
+    const rsToDeployment = {};
+    for (const rs of rsOwnerData) {
+      const ns = rs.metric.namespace;
+      const rsName = rs.metric.replicaset;
+      const ownerKind = rs.metric.owner_kind;
+      const ownerName = rs.metric.owner_name;
+      if (ownerKind === "Deployment" && rsName && ownerName) {
+        rsToDeployment[`${ns}/${rsName}`] = ownerName;
+      }
+    }
 
     const pods = statusData.map((item) => {
       const namespace = item.metric.namespace;
@@ -1101,10 +1118,45 @@ app.get("/metrics/pod", async (req, res) => {
         ? formatBytes(memItem.value[1])
         : { value: 0, unit: "bytes" };
 
+      // Owner resolution: Pod → ReplicaSet → Deployment, or Pod → StatefulSet/DaemonSet/Job
+      const ownerItem = ownerData.find(
+        (o) => o.metric.pod === podName && o.metric.namespace === namespace,
+      );
+      let ownerKind = null;
+      let ownerName = null;
+      if (ownerItem) {
+        const directKind = ownerItem.metric.owner_kind;
+        const directName = ownerItem.metric.owner_name;
+
+        if (directKind === "ReplicaSet") {
+          // Resolve ReplicaSet → Deployment via kube_replicaset_owner
+          const deploymentName =
+            rsToDeployment[`${namespace}/${directName}`];
+          if (deploymentName) {
+            ownerKind = "Deployment";
+            ownerName = deploymentName;
+          } else {
+            // Standalone ReplicaSet (not owned by a Deployment)
+            ownerKind = "ReplicaSet";
+            ownerName = directName;
+          }
+        } else if (
+          directKind &&
+          directKind !== "<none>" &&
+          directKind !== "Node"
+        ) {
+          // StatefulSet, DaemonSet, Job, CronJob, etc.
+          ownerKind = directKind;
+          ownerName = directName;
+        }
+      }
+
       return {
         namespace,
         name: podName,
         phase: item.metric.phase,
+        ownerKind,
+        ownerName,
         cpu: { value: cpuCores, unit: "cores" },
         memory: { value: memory.value, unit: memory.unit },
       };
