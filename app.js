@@ -982,7 +982,7 @@ function formatBytes(bytes) {
   };
 }
 
-function round(num, decimals = 0) {
+function round(num, decimals = 1) {
   if (num === null || num === undefined || isNaN(num)) return 0;
   const factor = Math.pow(10, decimals);
   return Math.round(parseFloat(num) * factor) / factor;
