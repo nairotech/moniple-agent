@@ -6,6 +6,7 @@ const yaml = require("js-yaml");
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
+const { DiagnosticsEngine } = require("./diagnostics");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -2056,6 +2057,34 @@ function startMetricsPush() {
 }
 
 // ============================================================================
+// DIAGNOSTICS ENGINE (DOCTOR)
+// ============================================================================
+
+let diagnosticsEngine = null;
+
+function startDiagnosticsEngine() {
+  if (!CONFIG.serverUrl || !CONFIG.apiKey) {
+    console.log("[Doctor] Server not configured. Diagnostics disabled.");
+    return;
+  }
+
+  try {
+    diagnosticsEngine = new DiagnosticsEngine({
+      k8sCoreApi,
+      k8sAppsApi,
+      k8sBatchApi: null, // BatchV1Api not initialized yet, executor handles gracefully
+      queryPrometheus,
+      serverUrl: CONFIG.serverUrl,
+      apiKey: CONFIG.apiKey,
+    });
+
+    diagnosticsEngine.startSchedule();
+  } catch (err) {
+    console.error("[Doctor] Failed to start diagnostics engine:", err.message);
+  }
+}
+
+// ============================================================================
 // START SERVER
 // ============================================================================
 
@@ -2085,6 +2114,9 @@ async function startServer() {
 
     // Start pushing metrics to server
     startMetricsPush();
+
+    // Start diagnostics engine (Doctor)
+    startDiagnosticsEngine();
   });
 }
 
