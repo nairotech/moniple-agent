@@ -106,6 +106,10 @@ class DiagnosticsEngine {
         const result = await llmClient.analyze(systemPrompt, userPrompt);
         analysis = result.analysis;
         tokensUsed = result.tokens_used;
+        if (!analysis || !analysis.findings) {
+          console.error("[Doctor] LLM returned empty or invalid analysis (no findings)");
+          status = "failed";
+        }
       } catch (llmErr) {
         console.error("[Doctor] LLM analysis failed:", llmErr.message);
         status = "failed";
@@ -428,22 +432,79 @@ class DiagnosticsEngine {
       }
 
       case "rollback_deployment": {
-        // Rollback by patching revision annotation
-        const rollbackPatch = {
+        try {
+          // List ReplicaSets owned by this deployment
+          const rsList = await k8sAppsApi.listNamespacedReplicaSet(ns, undefined, undefined, undefined, undefined, `app=${name}`);
+          // Filter to only RS owned by this deployment and sort by revision
+          const sorted = rsList.body.items
+            .filter(rs => rs.metadata.ownerReferences?.some(ref => ref.name === name))
+            .sort((a, b) => {
+              const revA = parseInt(a.metadata.annotations?.['deployment.kubernetes.io/revision'] || '0');
+              const revB = parseInt(b.metadata.annotations?.['deployment.kubernetes.io/revision'] || '0');
+              return revB - revA;
+            });
+          if (sorted.length < 2) {
+            return { success: false, message: 'No previous revision found to rollback to' };
+          }
+          const previousRS = sorted[1];
+          // Patch deployment with previous RS template
+          await k8sAppsApi.patchNamespacedDeployment(
+            name,
+            ns,
+            { spec: { template: previousRS.spec.template } },
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
+          );
+          const previousRev = previousRS.metadata.annotations?.['deployment.kubernetes.io/revision'] || 'unknown';
+          return { action: "deployment_rolled_back", deployment: name, namespace: ns, revision: previousRev };
+        } catch (rollbackErr) {
+          return { success: false, message: `Rollback failed: ${rollbackErr.message}` };
+        }
+      }
+
+      case "update_agent": {
+        // Self-update: change image tag to target version to bypass registry cache
+        const agentNs = process.env.POD_NAMESPACE || params.namespace || "moniple";
+        const agentDep = params.deployment || "moniple-agent";
+        const targetVersion = params.target_version;
+        // Validate version format to prevent injection
+        if (targetVersion) {
+          const versionRegex = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+          if (!versionRegex.test(targetVersion)) {
+            return { success: false, message: `Invalid version format: ${targetVersion}` };
+          }
+        }
+        const targetImage = targetVersion
+          ? `nairotech/moniple-agent:v${targetVersion}`
+          : "nairotech/moniple-agent:main";
+        console.log(`[Doctor] Updating agent image to ${targetImage}`);
+        const updatePatch = {
           spec: {
             template: {
               metadata: {
                 annotations: {
-                  "moniple.com/rollbackAt": new Date().toISOString(),
+                  "moniple.com/updatedAt": new Date().toISOString(),
                 },
+              },
+              spec: {
+                containers: [
+                  {
+                    name: "moniple-agent",
+                    image: targetImage,
+                  },
+                ],
               },
             },
           },
         };
         await k8sAppsApi.patchNamespacedDeployment(
-          name,
-          ns,
-          rollbackPatch,
+          agentDep,
+          agentNs,
+          updatePatch,
           undefined,
           undefined,
           undefined,
@@ -451,7 +512,7 @@ class DiagnosticsEngine {
           undefined,
           { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
         );
-        return { action: "deployment_rollback_triggered", deployment: name, namespace: ns };
+        return { action: "agent_updated", deployment: agentDep, namespace: agentNs, image: targetImage };
       }
 
       case "delete_job": {
@@ -502,20 +563,28 @@ class DiagnosticsEngine {
   startSchedule() {
     // Initial config fetch + pending check after 10 seconds
     setTimeout(async () => {
-      await this.fetchConfig();
+      try {
+        await this.fetchConfig();
 
-      // Check for pending manual triggers
-      await this.checkPendingTrigger();
+        // Check for pending manual triggers
+        await this.checkPendingTrigger();
 
-      // Start auto schedule if enabled
-      this._setupScheduleTimer();
+        // Start auto schedule if enabled
+        this._setupScheduleTimer();
+      } catch (err) {
+        console.error("[Doctor] Initial config fetch error:", err.message);
+      }
     }, 10000);
 
     // Refresh config and check pending every 60 seconds (piggybacking on push cycle)
     this.configRefreshInterval = setInterval(async () => {
-      await this.fetchConfig();
-      await this.checkPendingTrigger();
-      await this.pollAndExecuteActions();
+      try {
+        await this.fetchConfig();
+        await this.checkPendingTrigger();
+        await this.pollAndExecuteActions();
+      } catch (err) {
+        console.error("[Doctor] Config refresh cycle error:", err.message);
+      }
     }, 60000);
 
     console.log("[Doctor] Diagnostics engine started");
@@ -536,8 +605,12 @@ class DiagnosticsEngine {
       `[Doctor] Auto-diagnostics scheduled every ${this.config.schedule.interval_minutes || 30} minutes`
     );
 
-    this.scheduleTimer = setInterval(() => {
-      this.runDiagnostic("auto");
+    this.scheduleTimer = setInterval(async () => {
+      try {
+        await this.runDiagnostic("auto");
+      } catch (err) {
+        console.error("[Doctor] Scheduled diagnostic error:", err.message);
+      }
     }, intervalMs);
   }
 

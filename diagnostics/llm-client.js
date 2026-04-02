@@ -4,12 +4,31 @@
  * Supports: OpenAI, Anthropic, Google Gemini, Custom (OpenAI-compatible)
  */
 
+const LLM_TIMEOUT_MS = 300_000; // 5 minutes
+
 class LLMClient {
   constructor(config) {
     this.provider = config.provider; // openai, anthropic, google, custom
     this.model = config.model;
     this.apiKey = config.api_key;
     this.baseUrl = config.base_url;
+  }
+
+  /** fetch with timeout via AbortController */
+  async _fetch(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      return res;
+    } catch (err) {
+      if (err.name === "AbortError") {
+        throw new Error(`LLM request timed out after ${LLM_TIMEOUT_MS / 1000}s`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async analyze(systemPrompt, userPrompt) {
@@ -29,6 +48,9 @@ class LLMClient {
           break;
         case "zhipu":
           result = await this._callZhipu(systemPrompt, userPrompt);
+          break;
+        case "deepseek":
+          result = await this._callDeepSeek(systemPrompt, userPrompt);
           break;
         case "custom":
           result = await this._callCustom(systemPrompt, userPrompt);
@@ -57,7 +79,7 @@ class LLMClient {
   async _callOpenAI(systemPrompt, userPrompt) {
     const url = "https://api.openai.com/v1/chat/completions";
 
-    const response = await fetch(url, {
+    const response = await this._fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -95,7 +117,7 @@ class LLMClient {
   async _callAnthropic(systemPrompt, userPrompt) {
     const url = "https://api.anthropic.com/v1/messages";
 
-    const response = await fetch(url, {
+    const response = await this._fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -132,7 +154,7 @@ class LLMClient {
   async _callGoogle(systemPrompt, userPrompt) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
 
-    const response = await fetch(url, {
+    const response = await this._fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -168,7 +190,7 @@ class LLMClient {
     const baseUrl = this.baseUrl || "https://api.z.ai/api/coding/paas/v4";
     const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 
-    const response = await fetch(url, {
+    const response = await this._fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -202,6 +224,45 @@ class LLMClient {
     };
   }
 
+  // --- DeepSeek (OpenAI-compatible) ---
+  async _callDeepSeek(systemPrompt, userPrompt) {
+    const baseUrl = this.baseUrl || "https://api.deepseek.com/v1";
+    const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+
+    const response = await this._fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: this.model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`DeepSeek API error (${response.status}): ${err}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    const tokensUsed =
+      (data.usage?.prompt_tokens || 0) + (data.usage?.completion_tokens || 0);
+
+    return {
+      analysis: this._parseJSON(content),
+      tokens_used: tokensUsed,
+      raw_response: content,
+    };
+  }
+
   // --- Custom (OpenAI-compatible) ---
   async _callCustom(systemPrompt, userPrompt) {
     if (!this.baseUrl) {
@@ -210,7 +271,7 @@ class LLMClient {
 
     const url = `${this.baseUrl.replace(/\/$/, "")}/chat/completions`;
 
-    const response = await fetch(url, {
+    const response = await this._fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

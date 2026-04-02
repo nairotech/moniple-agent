@@ -441,7 +441,7 @@ const CONFIG = {
   apiUrl: process.env.PROMETHEUS_API_URL || "http://prometheus:9090/api/v1",
   apiUser: process.env.PROMETHEUS_API_USER || "",
   apiPassword: process.env.PROMETHEUS_API_PASSWORD || "",
-  threshold: parseInt(process.env.DEFAULT_THRESHOLD) || 80,
+  threshold: Number.isNaN(parseInt(process.env.DEFAULT_THRESHOLD)) ? 80 : parseInt(process.env.DEFAULT_THRESHOLD),
   // Moniple Server config
   serverUrl: process.env.MONIPLE_SERVER_URL || "",
   apiKey: process.env.MONIPLE_API_KEY || "",
@@ -449,6 +449,8 @@ const CONFIG = {
   // Auto-install monitoring stack
   autoInstallMonitoring: process.env.AUTO_INSTALL_MONITORING !== "false",
   monitoringNamespace: process.env.MONITORING_NAMESPACE || "moniple",
+  // Agent build date (injected at Docker build time)
+  agentBuildDate: process.env.AGENT_BUILD_DATE || "0",
 };
 
 // ============================================================================
@@ -459,6 +461,7 @@ let kc = null;
 let k8sAppsApi = null;
 let k8sCoreApi = null;
 let k8sRbacApi = null;
+let k8sBatchApi = null;
 
 function initKubernetesClient() {
   try {
@@ -474,6 +477,7 @@ function initKubernetesClient() {
     k8sAppsApi = kc.makeApiClient(k8s.AppsV1Api);
     k8sCoreApi = kc.makeApiClient(k8s.CoreV1Api);
     k8sRbacApi = kc.makeApiClient(k8s.RbacAuthorizationV1Api);
+    k8sBatchApi = kc.makeApiClient(k8s.BatchV1Api);
     return true;
   } catch (error) {
     console.error("Failed to initialize Kubernetes client:", error.message);
@@ -1008,8 +1012,10 @@ async function queryPrometheus(query) {
     options.headers = { Authorization: `Basic ${auth}` };
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
   try {
-    const response = await fetch(url, options);
+    const response = await fetch(url, { ...options, signal: controller.signal });
     const data = await response.json();
 
     if (data.status === "success") {
@@ -1018,8 +1024,14 @@ async function queryPrometheus(query) {
     console.error("Query failed:", query, data.error);
     return [];
   } catch (error) {
-    console.error("Fetch error:", error.message);
+    if (error.name === "AbortError") {
+      console.error("Query timeout (30s):", query);
+    } else {
+      console.error("Fetch error:", error.message);
+    }
     return [];
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -1034,42 +1046,56 @@ async function fetchAlerts() {
     options.headers = { Authorization: `Basic ${auth}` };
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
   try {
-    const response = await fetch(url, options);
+    const response = await fetch(url, { ...options, signal: controller.signal });
     const data = await response.json();
     return data.status === "success" ? data.data.alerts || [] : [];
   } catch (error) {
-    console.error("Alerts fetch error:", error.message);
+    if (error.name === "AbortError") {
+      console.error("Alerts fetch timeout (30s)");
+    } else {
+      console.error("Alerts fetch error:", error.message);
+    }
     return [];
+  } finally {
+    clearTimeout(timeout);
   }
 }
+
+// ============================================================================
+// API KEY AUTH MIDDLEWARE
+// ============================================================================
+
+const apiKeyAuth = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  if (!CONFIG.apiKey || apiKey === CONFIG.apiKey) {
+    next();
+  } else {
+    res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+};
 
 // ============================================================================
 // ENDPOINTS
 // ============================================================================
 
-// Health check
+// Health check (no auth required)
 app.get("/health", (req, res) => {
   res.json({ ok: true, timestamp: getTimestamp() });
 });
+
+// Apply API key auth to all /metrics/* routes
+app.use("/metrics", apiKeyAuth);
 
 // -----------------------------------------------------------------------------
 // GET /metrics/ns - Namespace listesi
 // -----------------------------------------------------------------------------
 app.get("/metrics/ns", async (req, res) => {
   try {
-    const result = await queryPrometheus(QUERIES.NS);
-    // kube-state-metrics v2 uses exported_namespace, v1 uses namespace
-    const namespaces = result
-      .map((item) => item.metric.exported_namespace || item.metric.namespace)
-      .filter(Boolean);
-
-    res.json({
-      ok: true,
-      timestamp: getTimestamp(),
-      count: namespaces.length,
-      namespaces: [...new Set(namespaces)].sort(),
-    });
+    const data = await getNsData();
+    res.json(data);
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -1080,103 +1106,8 @@ app.get("/metrics/ns", async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get("/metrics/pod", async (req, res) => {
   try {
-    const [statusData, cpuData, memoryData, ownerData, rsOwnerData] =
-      await Promise.all([
-        queryPrometheus(QUERIES.POD_STATUS),
-        queryPrometheus(QUERIES.POD_CPU_USAGE),
-        queryPrometheus(QUERIES.POD_MEMORY_USAGE),
-        queryPrometheus(QUERIES.POD_OWNER),
-        queryPrometheus(QUERIES.RS_OWNER),
-      ]);
-
-    // Build ReplicaSet → Deployment lookup map
-    const rsToDeployment = {};
-    for (const rs of rsOwnerData) {
-      const ns = rs.metric.namespace;
-      const rsName = rs.metric.replicaset;
-      const ownerKind = rs.metric.owner_kind;
-      const ownerName = rs.metric.owner_name;
-      if (ownerKind === "Deployment" && rsName && ownerName) {
-        rsToDeployment[`${ns}/${rsName}`] = ownerName;
-      }
-    }
-
-    const pods = statusData.map((item) => {
-      const namespace = item.metric.namespace;
-      const podName = item.metric.pod;
-
-      // CPU (cAdvisor uses namespace/pod labels - match by pod name since namespace might differ)
-      const cpuItem = cpuData.find(
-        (c) => c.metric.pod === podName && c.metric.namespace === namespace,
-      );
-      const cpuCores = cpuItem ? round(parseFloat(cpuItem.value[1]), 3) : 0;
-
-      // Memory
-      const memItem = memoryData.find(
-        (m) => m.metric.pod === podName && m.metric.namespace === namespace,
-      );
-      const memory = memItem
-        ? formatBytes(memItem.value[1])
-        : { value: 0, unit: "bytes" };
-
-      // Owner resolution: Pod → ReplicaSet → Deployment, or Pod → StatefulSet/DaemonSet/Job
-      const ownerItem = ownerData.find(
-        (o) => o.metric.pod === podName && o.metric.namespace === namespace,
-      );
-      let ownerKind = null;
-      let ownerName = null;
-      if (ownerItem) {
-        const directKind = ownerItem.metric.owner_kind;
-        const directName = ownerItem.metric.owner_name;
-
-        if (directKind === "ReplicaSet") {
-          // Resolve ReplicaSet → Deployment via kube_replicaset_owner
-          const deploymentName =
-            rsToDeployment[`${namespace}/${directName}`];
-          if (deploymentName) {
-            ownerKind = "Deployment";
-            ownerName = deploymentName;
-          } else {
-            // Standalone ReplicaSet (not owned by a Deployment)
-            ownerKind = "ReplicaSet";
-            ownerName = directName;
-          }
-        } else if (
-          directKind &&
-          directKind !== "<none>" &&
-          directKind !== "Node"
-        ) {
-          // StatefulSet, DaemonSet, Job, CronJob, etc.
-          ownerKind = directKind;
-          ownerName = directName;
-        }
-      }
-
-      return {
-        namespace,
-        name: podName,
-        phase: item.metric.phase,
-        ownerKind,
-        ownerName,
-        cpu: { value: cpuCores, unit: "cores" },
-        memory: { value: memory.value, unit: memory.unit },
-      };
-    });
-
-    // Summary
-    const summary = {
-      total: pods.length,
-      running: pods.filter((p) => p.phase === "Running").length,
-      pending: pods.filter((p) => p.phase === "Pending").length,
-      failed: pods.filter((p) => p.phase === "Failed").length,
-    };
-
-    res.json({
-      ok: true,
-      timestamp: getTimestamp(),
-      summary,
-      pods,
-    });
+    const data = await getPodData();
+    res.json(data);
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -1187,55 +1118,8 @@ app.get("/metrics/pod", async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get("/metrics/pvc", async (req, res) => {
   try {
-    // Try kubelet_volume_stats first (provides actual usage)
-    let [totalData, usageData] = await Promise.all([
-      queryPrometheus(QUERIES.PVC_TOTAL),
-      queryPrometheus(QUERIES.PVC_USAGE),
-    ]);
-
-    // Fallback to kube-state-metrics if kubelet_volume_stats not available
-    if (totalData.length === 0) {
-      totalData = await queryPrometheus(QUERIES.PVC_CAPACITY);
-    }
-
-    const pvcs = totalData.map((item) => {
-      // Handle both kubelet and kube-state-metrics label formats
-      const namespace = item.metric.exported_namespace || item.metric.namespace;
-      const pvcName =
-        item.metric.exported_persistentvolumeclaim ||
-        item.metric.persistentvolumeclaim;
-
-      const total = formatBytes(item.value[1]);
-      const usageItem = usageData.find(
-        (u) =>
-          (u.metric.exported_namespace || u.metric.namespace) === namespace &&
-          (u.metric.exported_persistentvolumeclaim ||
-            u.metric.persistentvolumeclaim) === pvcName,
-      );
-      // If no usage data available, show N/A
-      const usagePercent = usageItem
-        ? round(parseFloat(usageItem.value[1]))
-        : null;
-
-      return {
-        namespace,
-        name: pvcName,
-        total: { value: total.value, unit: total.unit },
-        usage:
-          usagePercent !== null
-            ? { value: usagePercent, unit: "%" }
-            : { value: "N/A", unit: "" },
-        critical:
-          usagePercent !== null ? usagePercent > CONFIG.threshold : false,
-      };
-    });
-
-    res.json({
-      ok: true,
-      timestamp: getTimestamp(),
-      count: pvcs.length,
-      pvcs,
-    });
+    const data = await getPvcData();
+    res.json(data);
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -1246,179 +1130,8 @@ app.get("/metrics/pvc", async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get("/metrics/node", async (req, res) => {
   try {
-    // Try node_uname_info first (has correct instance for node-exporter), fallback to kube_node_info
-    let [
-      nodeInfoExporter,
-      nodeInfoKsm,
-      memUsage,
-      memTotal,
-      diskUsage,
-      diskUsageCadvisor,
-      diskTotal,
-      diskTotalCadvisor,
-      cpuUsage,
-      cpuTotal,
-      podUsage,
-      podTotal,
-    ] = await Promise.all([
-      queryPrometheus(QUERIES.NODE_INFO_EXPORTER),
-      queryPrometheus(QUERIES.NODE_INFO_KSM),
-      queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
-      queryPrometheus(QUERIES.NODE_MEMORY_TOTAL),
-      queryPrometheus(QUERIES.NODE_DISK_USAGE),
-      queryPrometheus(QUERIES.NODE_DISK_USAGE_CADVISOR),
-      queryPrometheus(QUERIES.NODE_DISK_TOTAL),
-      queryPrometheus(QUERIES.NODE_DISK_TOTAL_CADVISOR),
-      queryPrometheus(QUERIES.NODE_CPU_USAGE),
-      queryPrometheus(QUERIES.NODE_CPU_TOTAL),
-      queryPrometheus(QUERIES.NODE_POD_USAGE),
-      queryPrometheus(QUERIES.NODE_POD_TOTAL),
-    ]);
-
-    // Use node_filesystem metrics if available, otherwise fallback to cadvisor
-    // Important: both usage and total must come from the same source for consistency
-    const useCadvisorDisk = diskUsage.length === 0;
-    const effectiveDiskUsage = useCadvisorDisk ? diskUsageCadvisor : diskUsage;
-    const effectiveDiskTotal = useCadvisorDisk ? diskTotalCadvisor : diskTotal;
-
-    // Prefer node_uname_info (node-exporter), fallback to kube_node_info
-    const nodeInfo =
-      nodeInfoExporter.length > 0 ? nodeInfoExporter : nodeInfoKsm;
-
-    const nodes = nodeInfo.map((item) => {
-      // node_uname_info uses nodename, kube_node_info uses node label
-      const nodeName =
-        item.metric.nodename || item.metric.node || item.metric.exported_node;
-      // node_uname_info has correct instance for node-exporter metrics
-      const instance = item.metric.instance;
-
-      // Memory (node-exporter uses instance label)
-      const memUsageItem = memUsage.find((m) => m.metric.instance === instance);
-      const memTotalItem = memTotal.find((m) => m.metric.node === nodeName);
-      const memoryUsagePercent = memUsageItem
-        ? round(parseFloat(memUsageItem.value[1]))
-        : 0;
-      const memoryTotal = memTotalItem
-        ? formatBytes(memTotalItem.value[1])
-        : { value: 0, unit: "GiB" };
-
-      // Disk (try node_filesystem first, fallback to cadvisor)
-      // node_filesystem uses instance like "192.168.65.3:9100"
-      // cadvisor uses instance as hostname like "docker-desktop" or kubernetes_io_hostname
-      const diskUsageItem = effectiveDiskUsage.find(
-        (d) =>
-          d.metric.instance === instance ||
-          d.metric.instance === nodeName ||
-          d.metric.kubernetes_io_hostname === nodeName,
-      );
-      const diskTotalItem = effectiveDiskTotal.find(
-        (d) =>
-          d.metric.node === nodeName ||
-          d.metric.instance === instance ||
-          d.metric.instance === nodeName ||
-          d.metric.kubernetes_io_hostname === nodeName,
-      );
-      const diskUsagePercent = diskUsageItem
-        ? round(parseFloat(diskUsageItem.value[1]))
-        : 0;
-      const diskTotalVal = diskTotalItem
-        ? formatBytes(diskTotalItem.value[1])
-        : { value: 0, unit: "GiB" };
-
-      // CPU
-      const cpuUsageItem = cpuUsage.find((c) => c.metric.instance === instance);
-      const cpuTotalItem = cpuTotal.find((c) => c.metric.node === nodeName);
-      const cpuUsagePercent = cpuUsageItem
-        ? round(parseFloat(cpuUsageItem.value[1]))
-        : 0;
-      const cpuTotalVal = cpuTotalItem
-        ? round(parseFloat(cpuTotalItem.value[1]))
-        : 0;
-
-      // Pod
-      const podUsageItem = podUsage.find((p) => p.metric.node === nodeName);
-      const podTotalItem = podTotal.find((p) => p.metric.node === nodeName);
-      const podUsagePercent = podUsageItem
-        ? round(parseFloat(podUsageItem.value[1]))
-        : 0;
-      const podTotalVal = podTotalItem
-        ? round(parseFloat(podTotalItem.value[1]))
-        : 0;
-
-      return {
-        name: nodeName,
-        instance,
-        cpu: {
-          usage: cpuUsagePercent,
-          total: cpuTotalVal,
-          unit: { usage: "%", total: "cores" },
-          critical: cpuUsagePercent > CONFIG.threshold,
-        },
-        memory: {
-          usage: memoryUsagePercent,
-          total: memoryTotal.value,
-          unit: { usage: "%", total: memoryTotal.unit },
-          critical: memoryUsagePercent > CONFIG.threshold,
-        },
-        disk: {
-          usage: diskUsagePercent,
-          total: diskTotalVal.value,
-          unit: { usage: "%", total: diskTotalVal.unit },
-          critical: diskUsagePercent > CONFIG.threshold,
-        },
-        pod: {
-          usage: podUsagePercent,
-          total: podTotalVal,
-          unit: { usage: "%", total: "pods" },
-          critical: podUsagePercent > CONFIG.threshold,
-        },
-      };
-    });
-
-    // Cluster summary
-    const nodeCount = nodes.length || 1;
-    const summary = {
-      nodeCount,
-      cpu: {
-        usage: round(
-          nodes.reduce((sum, n) => sum + n.cpu.usage, 0) / nodeCount,
-        ),
-        total: nodes.reduce((sum, n) => sum + n.cpu.total, 0),
-        unit: "%",
-        critical: nodes.some((n) => n.cpu.critical),
-      },
-      memory: {
-        usage: round(
-          nodes.reduce((sum, n) => sum + n.memory.usage, 0) / nodeCount,
-        ),
-        total: round(nodes.reduce((sum, n) => sum + n.memory.total, 0)),
-        unit: "%",
-        critical: nodes.some((n) => n.memory.critical),
-      },
-      disk: {
-        usage: round(
-          nodes.reduce((sum, n) => sum + n.disk.usage, 0) / nodeCount,
-        ),
-        total: round(nodes.reduce((sum, n) => sum + n.disk.total, 0)),
-        unit: "%",
-        critical: nodes.some((n) => n.disk.critical),
-      },
-      pod: {
-        usage: round(
-          nodes.reduce((sum, n) => sum + n.pod.usage, 0) / nodeCount,
-        ),
-        total: nodes.reduce((sum, n) => sum + n.pod.total, 0),
-        unit: "%",
-        critical: nodes.some((n) => n.pod.critical),
-      },
-    };
-
-    res.json({
-      ok: true,
-      timestamp: getTimestamp(),
-      summary,
-      nodes,
-    });
+    const data = await getNodeData();
+    res.json(data);
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -1429,32 +1142,8 @@ app.get("/metrics/node", async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get("/metrics/alerts", async (req, res) => {
   try {
-    const alerts = await fetchAlerts();
-
-    const formatted = alerts.map((alert) => ({
-      name: alert.labels?.alertname || "Unknown",
-      severity: alert.labels?.severity || "unknown",
-      state: alert.state,
-      namespace: alert.labels?.namespace || "",
-      summary:
-        alert.annotations?.summary || alert.annotations?.description || "",
-      activeAt: alert.activeAt,
-    }));
-
-    const summary = {
-      total: formatted.length,
-      firing: formatted.filter((a) => a.state === "firing").length,
-      pending: formatted.filter((a) => a.state === "pending").length,
-      critical: formatted.filter((a) => a.severity === "critical").length,
-      warning: formatted.filter((a) => a.severity === "warning").length,
-    };
-
-    res.json({
-      ok: true,
-      timestamp: getTimestamp(),
-      summary,
-      alerts: formatted,
-    });
+    const data = await getAlertsData();
+    res.json(data);
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -1465,108 +1154,8 @@ app.get("/metrics/alerts", async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get("/metrics/overview", async (req, res) => {
   try {
-    const [
-      nodeInfo,
-      memUsage,
-      cpuUsage,
-      diskUsage,
-      diskUsageCadvisor,
-      podUsage,
-      podStatus,
-      alerts,
-    ] = await Promise.all([
-      queryPrometheus(QUERIES.NODE_INFO),
-      queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
-      queryPrometheus(QUERIES.NODE_CPU_USAGE),
-      queryPrometheus(QUERIES.NODE_DISK_USAGE),
-      queryPrometheus(QUERIES.NODE_DISK_USAGE_CADVISOR),
-      queryPrometheus(QUERIES.NODE_POD_USAGE),
-      queryPrometheus(QUERIES.POD_STATUS),
-      fetchAlerts(),
-    ]);
-
-    // Use node_filesystem metrics if available, otherwise fallback to cadvisor
-    const effectiveDiskUsage =
-      diskUsage.length > 0 ? diskUsage : diskUsageCadvisor;
-
-    const nodeCount = nodeInfo.length || 1;
-
-    // Calculate averages (handle empty arrays)
-    const avgCpu =
-      cpuUsage.length > 0
-        ? round(
-            cpuUsage.reduce((sum, c) => sum + parseFloat(c.value[1] || 0), 0) /
-              cpuUsage.length,
-          )
-        : 0;
-    const avgMemory =
-      memUsage.length > 0
-        ? round(
-            memUsage.reduce((sum, m) => sum + parseFloat(m.value[1] || 0), 0) /
-              memUsage.length,
-          )
-        : 0;
-    const avgDisk =
-      effectiveDiskUsage.length > 0
-        ? round(
-            effectiveDiskUsage.reduce(
-              (sum, d) => sum + parseFloat(d.value[1] || 0),
-              0,
-            ) / effectiveDiskUsage.length,
-          )
-        : 0;
-    const avgPod =
-      podUsage.length > 0
-        ? round(
-            podUsage.reduce((sum, p) => sum + parseFloat(p.value[1] || 0), 0) /
-              podUsage.length,
-          )
-        : 0;
-
-    // Pod summary
-    const runningPods = podStatus.filter(
-      (p) => p.metric.phase === "Running",
-    ).length;
-    const totalPods = podStatus.length;
-
-    // Alert summary
-    const firingAlerts = alerts.filter((a) => a.state === "firing").length;
-    const criticalAlerts = alerts.filter(
-      (a) => a.labels?.severity === "critical",
-    ).length;
-
-    res.json({
-      ok: true,
-      timestamp: getTimestamp(),
-      cluster: {
-        nodes: nodeCount,
-        pods: { running: runningPods, total: totalPods },
-      },
-      usage: {
-        cpu: { value: avgCpu, unit: "%", critical: avgCpu > CONFIG.threshold },
-        memory: {
-          value: avgMemory,
-          unit: "%",
-          critical: avgMemory > CONFIG.threshold,
-        },
-        disk: {
-          value: avgDisk,
-          unit: "%",
-          critical: avgDisk > CONFIG.threshold,
-        },
-        pod: { value: avgPod, unit: "%", critical: avgPod > CONFIG.threshold },
-      },
-      alerts: {
-        total: alerts.length,
-        firing: firingAlerts,
-        critical: criticalAlerts,
-      },
-      healthy:
-        avgCpu < CONFIG.threshold &&
-        avgMemory < CONFIG.threshold &&
-        avgDisk < CONFIG.threshold &&
-        criticalAlerts === 0,
-    });
+    const data = await getOverviewData();
+    res.json(data);
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -1680,7 +1269,9 @@ async function getNodeData() {
     memUsage,
     memTotal,
     diskUsage,
+    diskUsageCadvisor,
     diskTotal,
+    diskTotalCadvisor,
     cpuUsage,
     cpuTotal,
     podUsage,
@@ -1691,31 +1282,64 @@ async function getNodeData() {
     queryPrometheus(QUERIES.NODE_MEMORY_USAGE),
     queryPrometheus(QUERIES.NODE_MEMORY_TOTAL),
     queryPrometheus(QUERIES.NODE_DISK_USAGE),
+    queryPrometheus(QUERIES.NODE_DISK_USAGE_CADVISOR),
     queryPrometheus(QUERIES.NODE_DISK_TOTAL),
+    queryPrometheus(QUERIES.NODE_DISK_TOTAL_CADVISOR),
     queryPrometheus(QUERIES.NODE_CPU_USAGE),
     queryPrometheus(QUERIES.NODE_CPU_TOTAL),
     queryPrometheus(QUERIES.NODE_POD_USAGE),
     queryPrometheus(QUERIES.NODE_POD_TOTAL),
   ]);
 
+  // Use node_filesystem metrics if available, otherwise fallback to cadvisor
+  const useCadvisorDisk = diskUsage.length === 0;
+  const effectiveDiskUsage = useCadvisorDisk ? diskUsageCadvisor : diskUsage;
+  const effectiveDiskTotal = useCadvisorDisk ? diskTotalCadvisor : diskTotal;
+
   const nodeInfo = nodeInfoExporter.length > 0 ? nodeInfoExporter : nodeInfoKsm;
+
+  // Build lookup maps for O(1) access (I2)
+  const memUsageMap = new Map();
+  memUsage.forEach((m) => memUsageMap.set(m.metric.instance, m));
+  const memTotalMap = new Map();
+  memTotal.forEach((m) => memTotalMap.set(m.metric.node, m));
+  const cpuUsageMap = new Map();
+  cpuUsage.forEach((c) => cpuUsageMap.set(c.metric.instance, c));
+  const cpuTotalMap = new Map();
+  cpuTotal.forEach((c) => cpuTotalMap.set(c.metric.node, c));
+  const podUsageMap = new Map();
+  podUsage.forEach((p) => podUsageMap.set(p.metric.node, p));
+  const podTotalMap = new Map();
+  podTotal.forEach((p) => podTotalMap.set(p.metric.node, p));
 
   const nodes = nodeInfo.map((item) => {
     const nodeName =
       item.metric.nodename || item.metric.node || item.metric.exported_node;
     const instance = item.metric.instance;
 
-    const memUsageItem = memUsage.find((m) => m.metric.instance === instance);
-    const memTotalItem = memTotal.find((m) => m.metric.node === nodeName);
+    const memUsageItem = memUsageMap.get(instance);
+    const memTotalItem = memTotalMap.get(nodeName);
     const memoryUsagePercent = memUsageItem
       ? round(parseFloat(memUsageItem.value[1]))
       : 0;
-    const memoryTotal = memTotalItem
+    const memoryTotalVal = memTotalItem
       ? formatBytes(memTotalItem.value[1])
       : { value: 0, unit: "GiB" };
 
-    const diskUsageItem = diskUsage.find((d) => d.metric.instance === instance);
-    const diskTotalItem = diskTotal.find((d) => d.metric.node === nodeName);
+    // Disk: multi-key lookup (instance, nodeName, kubernetes_io_hostname)
+    const diskUsageItem = effectiveDiskUsage.find(
+      (d) =>
+        d.metric.instance === instance ||
+        d.metric.instance === nodeName ||
+        d.metric.kubernetes_io_hostname === nodeName,
+    );
+    const diskTotalItem = effectiveDiskTotal.find(
+      (d) =>
+        d.metric.node === nodeName ||
+        d.metric.instance === instance ||
+        d.metric.instance === nodeName ||
+        d.metric.kubernetes_io_hostname === nodeName,
+    );
     const diskUsagePercent = diskUsageItem
       ? round(parseFloat(diskUsageItem.value[1]))
       : 0;
@@ -1723,8 +1347,8 @@ async function getNodeData() {
       ? formatBytes(diskTotalItem.value[1])
       : { value: 0, unit: "GiB" };
 
-    const cpuUsageItem = cpuUsage.find((c) => c.metric.instance === instance);
-    const cpuTotalItem = cpuTotal.find((c) => c.metric.node === nodeName);
+    const cpuUsageItem = cpuUsageMap.get(instance);
+    const cpuTotalItem = cpuTotalMap.get(nodeName);
     const cpuUsagePercent = cpuUsageItem
       ? round(parseFloat(cpuUsageItem.value[1]))
       : 0;
@@ -1732,8 +1356,8 @@ async function getNodeData() {
       ? round(parseFloat(cpuTotalItem.value[1]))
       : 0;
 
-    const podUsageItem = podUsage.find((p) => p.metric.node === nodeName);
-    const podTotalItem = podTotal.find((p) => p.metric.node === nodeName);
+    const podUsageItem = podUsageMap.get(nodeName);
+    const podTotalItem = podTotalMap.get(nodeName);
     const podUsagePercent = podUsageItem
       ? round(parseFloat(podUsageItem.value[1]))
       : 0;
@@ -1752,8 +1376,8 @@ async function getNodeData() {
       },
       memory: {
         usage: memoryUsagePercent,
-        total: memoryTotal.value,
-        unit: { usage: "%", total: memoryTotal.unit },
+        total: memoryTotalVal.value,
+        unit: { usage: "%", total: memoryTotalVal.unit },
         critical: memoryUsagePercent > CONFIG.threshold,
       },
       disk: {
@@ -1815,6 +1439,23 @@ async function getPodData() {
       queryPrometheus(QUERIES.RS_OWNER),
     ]);
 
+  // Build lookup maps for O(1) access (I2)
+  const cpuMap = new Map();
+  cpuData.forEach((c) => {
+    const key = `${c.metric.namespace}/${c.metric.pod}`;
+    cpuMap.set(key, c);
+  });
+  const memMap = new Map();
+  memoryData.forEach((m) => {
+    const key = `${m.metric.namespace}/${m.metric.pod}`;
+    memMap.set(key, m);
+  });
+  const ownerMap = new Map();
+  ownerData.forEach((o) => {
+    const key = `${o.metric.namespace}/${o.metric.pod}`;
+    ownerMap.set(key, o);
+  });
+
   // Build ReplicaSet → Deployment lookup map
   const rsToDeployment = {};
   for (const rs of rsOwnerData) {
@@ -1830,21 +1471,17 @@ async function getPodData() {
   const pods = statusData.map((item) => {
     const namespace = item.metric.exported_namespace || item.metric.namespace;
     const podName = item.metric.pod;
-    const cpuItem = cpuData.find(
-      (c) => c.metric.pod === podName && c.metric.namespace === namespace,
-    );
+    const podKey = `${namespace}/${podName}`;
+
+    const cpuItem = cpuMap.get(podKey);
     const cpuCores = cpuItem ? round(parseFloat(cpuItem.value[1]), 3) : 0;
-    const memItem = memoryData.find(
-      (m) => m.metric.pod === podName && m.metric.namespace === namespace,
-    );
+    const memItem = memMap.get(podKey);
     const memory = memItem
       ? formatBytes(memItem.value[1])
       : { value: 0, unit: "bytes" };
 
     // Owner resolution: Pod → ReplicaSet → Deployment, or Pod → StatefulSet/DaemonSet/Job
-    const ownerItem = ownerData.find(
-      (o) => o.metric.pod === podName && o.metric.namespace === namespace,
-    );
+    const ownerItem = ownerMap.get(podKey);
     let podOwnerKind = null;
     let podOwnerName = null;
     if (ownerItem) {
@@ -2021,8 +1658,14 @@ async function pushMetricsToServer() {
         pvc,
         ns,
         alerts,
+        agent_version: CONFIG.agentBuildDate,
       }),
     });
+
+    if (!response.ok) {
+      console.error(`[${new Date().toISOString()}] Push failed with status ${response.status}`);
+      return;
+    }
 
     const result = await response.json();
     if (result.ok) {
@@ -2039,6 +1682,8 @@ async function pushMetricsToServer() {
 }
 
 // Start push interval
+let metricsPushInterval = null;
+
 function startMetricsPush() {
   if (!CONFIG.serverUrl || !CONFIG.apiKey) {
     console.log("Moniple Server not configured. Skipping metrics push.");
@@ -2046,14 +1691,20 @@ function startMetricsPush() {
   }
 
   console.log(
-    `Starting metrics push to ${CONFIG.serverUrl} every ${CONFIG.pushInterval}s`,
+    `Starting metrics push to ${CONFIG.serverUrl} every ${CONFIG.pushInterval}s (agent_build_date: ${CONFIG.agentBuildDate})`,
   );
 
   // Initial push after 5 seconds
   setTimeout(pushMetricsToServer, 5000);
 
   // Then push at configured interval
-  setInterval(pushMetricsToServer, CONFIG.pushInterval * 1000);
+  metricsPushInterval = setInterval(async () => {
+    try {
+      await pushMetricsToServer();
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Unhandled push error:`, err.message);
+    }
+  }, CONFIG.pushInterval * 1000);
 }
 
 // ============================================================================
@@ -2072,7 +1723,7 @@ function startDiagnosticsEngine() {
     diagnosticsEngine = new DiagnosticsEngine({
       k8sCoreApi,
       k8sAppsApi,
-      k8sBatchApi: null, // BatchV1Api not initialized yet, executor handles gracefully
+      k8sBatchApi,
       queryPrometheus,
       serverUrl: CONFIG.serverUrl,
       apiKey: CONFIG.apiKey,
@@ -2108,8 +1759,8 @@ async function startServer() {
   }
 
   // Start Express server
-  app.listen(port, () => {
-    console.log(`Moniple Agent running on port ${port}`);
+  const server = app.listen(port, () => {
+    console.log(`Moniple Agent running on port ${port} (build: ${CONFIG.agentBuildDate})`);
     console.log(`Prometheus API: ${CONFIG.apiUrl}`);
 
     // Start pushing metrics to server
@@ -2118,6 +1769,34 @@ async function startServer() {
     // Start diagnostics engine (Doctor)
     startDiagnosticsEngine();
   });
+
+  // Graceful shutdown handler
+  const shutdown = () => {
+    console.log("Shutting down gracefully...");
+
+    if (metricsPushInterval) {
+      clearInterval(metricsPushInterval);
+      metricsPushInterval = null;
+    }
+
+    if (diagnosticsEngine) {
+      diagnosticsEngine.stop();
+    }
+
+    server.close(() => {
+      console.log("HTTP server closed.");
+      process.exit(0);
+    });
+
+    // Force exit after 10 seconds if server.close hangs
+    setTimeout(() => {
+      console.error("Forced shutdown after timeout.");
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 // Start the server
