@@ -480,7 +480,7 @@ class DiagnosticsEngine {
         }
         const targetImage = targetVersion
           ? `nairotech/moniple-agent:v${targetVersion}`
-          : "nairotech/moniple-agent:main";
+          : "nairotech/moniple-agent:latest";
         console.log(`[Doctor] Updating agent image to ${targetImage}`);
         const updatePatch = {
           spec: {
