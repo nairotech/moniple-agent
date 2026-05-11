@@ -582,6 +582,9 @@ class DiagnosticsEngine {
         await this.fetchConfig();
         await this.checkPendingTrigger();
         await this.pollAndExecuteActions();
+        // Re-evaluate schedule on every refresh so app-side toggles
+        // (auto_enabled / interval_minutes) take effect without agent restart.
+        this._setupScheduleTimer();
       } catch (err) {
         console.error("[Doctor] Config refresh cycle error:", err.message);
       }
@@ -591,33 +594,74 @@ class DiagnosticsEngine {
   }
 
   _setupScheduleTimer() {
+    const schedule = this.config?.schedule;
+    const shouldRun = !!(this.config?.enabled && schedule?.auto_enabled);
+    const intervalMin = schedule?.interval_minutes || 30;
+    const intervalMs = intervalMin * 60 * 1000;
+
+    // Idempotency: if signature unchanged, leave the existing timer alone so we
+    // don't reset the fire cadence every 60s config refresh.
+    const sig = shouldRun ? `${intervalMin}` : "off";
+    if (this._scheduleSig === sig) {
+      return;
+    }
+    this._scheduleSig = sig;
+
     if (this.scheduleTimer) {
       clearInterval(this.scheduleTimer);
       this.scheduleTimer = null;
     }
+    if (this.scheduleFirstTimeout) {
+      clearTimeout(this.scheduleFirstTimeout);
+      this.scheduleFirstTimeout = null;
+    }
 
-    if (!this.config?.enabled || !this.config?.schedule?.auto_enabled) {
+    if (!shouldRun) {
+      console.log("[Doctor] Auto-diagnostics disabled");
       return;
     }
 
-    const intervalMs = (this.config.schedule.interval_minutes || 30) * 60 * 1000;
+    // Compute delay until first fire based on last_run_at, so a freshly enabled
+    // schedule fires "interval_minutes after the last run" rather than always
+    // "interval_minutes from now". For brand-new schedules (no last_run_at),
+    // fire after a short bootstrap delay so the change is visible quickly.
+    const lastRunIso = schedule?.last_run_at;
+    let firstDelayMs;
+    if (lastRunIso) {
+      const lastRunMs = Date.parse(lastRunIso);
+      const dueAtMs = lastRunMs + intervalMs;
+      firstDelayMs = Math.max(5000, dueAtMs - Date.now()); // floor 5s
+    } else {
+      firstDelayMs = 5000; // bootstrap: fire ~5s after enable
+    }
+
     console.log(
-      `[Doctor] Auto-diagnostics scheduled every ${this.config.schedule.interval_minutes || 30} minutes`
+      `[Doctor] Auto-diagnostics scheduled every ${intervalMin} minutes (first fire in ${Math.round(firstDelayMs / 1000)}s)`
     );
 
-    this.scheduleTimer = setInterval(async () => {
+    const fire = async () => {
       try {
         await this.runDiagnostic("auto");
       } catch (err) {
         console.error("[Doctor] Scheduled diagnostic error:", err.message);
       }
-    }, intervalMs);
+    };
+
+    this.scheduleFirstTimeout = setTimeout(async () => {
+      this.scheduleFirstTimeout = null;
+      await fire();
+      this.scheduleTimer = setInterval(fire, intervalMs);
+    }, firstDelayMs);
   }
 
   stop() {
     if (this.scheduleTimer) {
       clearInterval(this.scheduleTimer);
       this.scheduleTimer = null;
+    }
+    if (this.scheduleFirstTimeout) {
+      clearTimeout(this.scheduleFirstTimeout);
+      this.scheduleFirstTimeout = null;
     }
     if (this.configRefreshInterval) {
       clearInterval(this.configRefreshInterval);
