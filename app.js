@@ -1681,6 +1681,56 @@ async function pushMetricsToServer() {
   }
 }
 
+// Best-effort "agent installed & running" ping.
+//
+// Fires on boot BEFORE the slow monitoring-stack install, so the server (and
+// therefore the app) learns the agent is up within seconds — well before the
+// first metrics push (~70s later). Hits /agent/heartbeat, which records
+// agent_connected_at WITHOUT setting has_metrics, so the app shows the
+// "installed, waiting for first metrics" screen. Never blocks boot: it retries
+// a few times and gives up silently. If it never lands, the first metrics push
+// sets both fields anyway and the app simply skips the waiting screen.
+async function sendConnectPing() {
+  if (!CONFIG.serverUrl || !CONFIG.apiKey) {
+    return; // Server not configured, nothing to ping
+  }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(`${CONFIG.serverUrl}/api/v1/agent/heartbeat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${CONFIG.apiKey}`,
+        },
+        body: JSON.stringify({
+          agent_version: CONFIG.agentBuildDate,
+          timestamp: Math.floor(Date.now() / 1000),
+          status: "healthy",
+        }),
+      });
+      if (response.ok) {
+        console.log(
+          `[${new Date().toISOString()}] Connect ping sent — agent install signaled to server`,
+        );
+        return;
+      }
+      console.error(
+        `[${new Date().toISOString()}] Connect ping failed: HTTP ${response.status}`,
+      );
+    } catch (error) {
+      console.error(
+        `[${new Date().toISOString()}] Connect ping error (attempt ${attempt}/3):`,
+        error.message,
+      );
+    }
+    // Brief backoff before retry (server may still be cold / DNS not ready)
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  console.error(
+    `[${new Date().toISOString()}] Connect ping gave up after 3 attempts (metrics push will set state later)`,
+  );
+}
+
 // Start push interval
 let metricsPushInterval = null;
 
@@ -1740,6 +1790,12 @@ function startDiagnosticsEngine() {
 // ============================================================================
 
 async function startServer() {
+  // Fire-and-forget: signal "agent installed & running" to the server BEFORE
+  // the slow monitoring-stack install below, so the app flips from the install
+  // guide to "waiting for first metrics" within seconds. Not awaited — must
+  // never delay or block boot.
+  sendConnectPing();
+
   // Initialize Kubernetes client and ensure monitoring stack
   if (CONFIG.autoInstallMonitoring) {
     const k8sInitialized = initKubernetesClient();
