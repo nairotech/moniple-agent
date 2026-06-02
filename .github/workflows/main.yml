@@ -24,12 +24,23 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Stamp the build with a unix timestamp. This becomes the agent's reported
+      # version (AGENT_BUILD_DATE) AND the immutable image tag (v<ts>), so the
+      # in-app "agent update available" feature can compare versions and the
+      # update_agent self-update can pull nairotech/moniple-agent:v<ts>.
+      - name: Compute build timestamp
+        id: build_ts
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            AGENT_BUILD_DATE=${{ steps.build_ts.outputs.ts }}
           tags: |
             nairotech/moniple-agent:main
             nairotech/moniple-agent:latest
+            nairotech/moniple-agent:v${{ steps.build_ts.outputs.ts }}
