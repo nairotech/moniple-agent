@@ -1,19 +1,12 @@
 const express = require("express");
 const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
-const k8s = require("@kubernetes/client-node");
-const yaml = require("js-yaml");
-const fs = require("fs");
-const path = require("path");
 const { DiagnosticsEngine } = require("./diagnostics");
 const CONFIG = require("./lib/config");
-const { formatBytes, round, getTimestamp } = require("./lib/utils");
-const QUERIES = require("./lib/queries");
 const swaggerDocument = require("./lib/swagger");
-const { queryPrometheus, fetchAlerts } = require("./lib/prometheus");
+const { queryPrometheus } = require("./lib/prometheus");
 const k8sClient = require("./lib/k8s/client");
 const monitoring = require("./lib/k8s/monitoring");
-const collectors = require("./lib/collectors");
 const serverPush = require("./lib/server-push");
 const { registerRoutes } = require("./lib/routes");
 
