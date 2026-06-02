@@ -1,3 +1,27 @@
+# =============================================================================
+# moniple-agent FULL RBAC (auto-install variant)
+# =============================================================================
+# WARNING: This ClusterRole is effectively CLUSTER-ADMIN-EQUIVALENT. It grants
+# cluster-wide write on `secrets` and full management of
+# `clusterroles`/`clusterrolebindings`. This breadth is REQUIRED ONLY when the
+# agent runs with AUTO_INSTALL_MONITORING=true (the default), because the agent:
+#
+#   (a) bootstraps the kube-state-metrics RBAC during auto-install — it must
+#       create the KSM ServiceAccount, ClusterRole and ClusterRoleBinding, and
+#       reconcile Secrets/ConfigMaps for the monitoring stack; and
+#   (b) satisfies managed-Kubernetes RBAC-escalation protection (GKE/EKS/AKS):
+#       a subject can only GRANT permissions it ALREADY HOLDS. So to create the
+#       KSM ClusterRole (which needs broad list/watch across many API groups),
+#       the agent's own ClusterRole must itself hold every one of those grants —
+#       otherwise the API server rejects the creation with a 403 escalation
+#       error.
+#
+# If you pre-install your monitoring stack yourself and set
+# AUTO_INSTALL_MONITORING=false, prefer the least-privilege variant in
+# `moniple-agent-rbac-minimal.yaml` instead (read-only, no secrets, no RBAC
+# write). Do NOT narrow the rules below while auto-install is enabled — doing so
+# breaks installs on managed clusters via the escalation protection above.
+# =============================================================================
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -28,6 +52,10 @@ rules:
       - endpoints
       - serviceaccounts
       - configmaps
+      # secrets (cluster-wide write): needed to create/reconcile the monitoring
+      # stack's secrets during auto-install. This is the single most sensitive
+      # grant here — drop it (use the minimal variant) if you pre-install
+      # monitoring yourself.
       - secrets
       - persistentvolumeclaims
       - persistentvolumes
@@ -102,7 +130,12 @@ rules:
     resources:
       - leases
     verbs: ["list", "watch"]
-  # RBAC management - agent creates roles for kube-state-metrics and vmagent
+  # RBAC management - agent creates roles for kube-state-metrics and vmagent.
+  # Required for auto-install: the agent provisions the KSM/vmagent
+  # ClusterRoles + bindings. Combined with the broad grants above, this also
+  # satisfies GKE/EKS/AKS escalation protection (the agent can only grant what
+  # it already holds). Remove this rule only with AUTO_INSTALL_MONITORING=false
+  # (see moniple-agent-rbac-minimal.yaml).
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources:
       - clusterroles

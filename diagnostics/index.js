@@ -7,6 +7,55 @@ const { DiagnosticCollector } = require("./collector");
 const { LLMClient } = require("./llm-client");
 const { getSystemPrompt, getUserPrompt } = require("./prompts");
 
+// ---------------------------------------------------------------------------
+// Remediation guardrails (security)
+// ---------------------------------------------------------------------------
+
+// Namespaces the agent must NEVER mutate via remediation, even if the server
+// approves an action targeting them. Protects the control plane / system.
+// NOTE: the monitoring namespace is intentionally NOT here — legit remediation
+// (e.g. restart a stuck vmagent) may target it.
+const PROTECTED_NAMESPACES = new Set([
+  "kube-system",
+  "kube-public",
+  "kube-node-lease",
+]);
+
+// Action types the agent is allowed to execute. Anything else is rejected.
+const ALLOWED_ACTION_TYPES = new Set([
+  "restart_pod",
+  "restart_deployment",
+  "scale_deployment",
+  "delete_pod",
+  "cordon_node",
+  "uncordon_node",
+  "adjust_resources",
+  "rollback_deployment",
+  "delete_job",
+  "update_agent",
+]);
+
+// Destructive actions blocked when DOCTOR_REMEDIATION_MODE=safe.
+const DESTRUCTIVE_ACTION_TYPES = new Set([
+  "delete_pod",
+  "delete_job",
+  "scale_deployment",
+  "cordon_node",
+  "rollback_deployment",
+]);
+
+// Remediation mode read once at module load: off | safe | full (default full).
+// - off:  reject every remediation action.
+// - safe: reject destructive actions, allow the rest.
+// - full: allow all allowed/validated actions (default — preserves prod behavior).
+const REMEDIATION_MODE = (() => {
+  const raw = (process.env.DOCTOR_REMEDIATION_MODE || "full").toLowerCase();
+  return ["off", "safe", "full"].includes(raw) ? raw : "full";
+})();
+
+// Kubernetes resource quantity (e.g. "100m", "256Mi", "1.5", "2Gi").
+const K8S_QUANTITY_REGEX = /^\d+(\.\d+)?(m|Mi|Gi|Ki|M|G|K|Ti|T|P|Pi|n|u)?$/;
+
 class DiagnosticsEngine {
   constructor({
     k8sCoreApi,
@@ -294,6 +343,67 @@ class DiagnosticsEngine {
     const ns = action.target_namespace;
     const name = action.target_name;
     const params = action.parameters || {};
+
+    // -----------------------------------------------------------------------
+    // Guardrails: validate BEFORE any k8s call. Rejected actions throw an
+    // Error here; pollAndExecuteActions() catches it and reports the action
+    // back to the server as "failed" with the reason (existing failure path).
+    // -----------------------------------------------------------------------
+
+    // 1. Remediation globally disabled by agent config.
+    if (REMEDIATION_MODE === "off") {
+      throw new Error("remediation disabled by agent config");
+    }
+
+    // 2. Unknown / unsupported action type.
+    if (!ALLOWED_ACTION_TYPES.has(action.action_type)) {
+      throw new Error("unsupported action type");
+    }
+
+    // 3. Target namespace is on the protected (system) denylist.
+    if (ns && PROTECTED_NAMESPACES.has(ns)) {
+      throw new Error("protected namespace");
+    }
+
+    // 4. Destructive action attempted in safe mode.
+    if (
+      REMEDIATION_MODE === "safe" &&
+      DESTRUCTIVE_ACTION_TYPES.has(action.action_type)
+    ) {
+      throw new Error("destructive action blocked in safe mode");
+    }
+
+    // 5. Per-type parameter validation.
+    if (action.action_type === "scale_deployment") {
+      const replicas = params.replicas;
+      if (
+        !Number.isInteger(replicas) ||
+        replicas < 0 ||
+        replicas > 1000
+      ) {
+        throw new Error("invalid replicas");
+      }
+    }
+
+    if (action.action_type === "adjust_resources") {
+      for (const bag of [params.request, params.limit]) {
+        if (bag === undefined || bag === null) continue;
+        // Accept either a bare quantity string or a {cpu, memory} object.
+        const values =
+          typeof bag === "object" ? Object.values(bag) : [bag];
+        for (const v of values) {
+          if (v === undefined || v === null) continue;
+          if (typeof v !== "string" || !K8S_QUANTITY_REGEX.test(v)) {
+            throw new Error("invalid resource quantity");
+          }
+        }
+      }
+    }
+
+    // Audit log: every action that passed validation and is about to execute.
+    console.log(
+      `[Doctor][audit] executing action=${action.action_type} target=${ns || "-"}/${name || "-"} mode=${REMEDIATION_MODE}`
+    );
 
     switch (action.action_type) {
       case "restart_pod": {

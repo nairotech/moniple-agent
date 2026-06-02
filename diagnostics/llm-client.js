@@ -6,6 +6,48 @@
 
 const LLM_TIMEOUT_MS = 300_000; // 5 minutes
 
+// Block server-supplied LLM base_urls that point at SSRF-sensitive targets
+// (cloud metadata, loopback, and — unless explicitly allowed — private/cluster
+// addresses). Prevents a compromised server from exfiltrating the LLM API key
+// or pivoting into the cluster network via a crafted custom base_url.
+function assertSafeLlmEndpoint(rawUrl) {
+  let u;
+  try { u = new URL(rawUrl); } catch (_) {
+    throw new Error(`Invalid LLM base_url: ${rawUrl}`);
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") {
+    throw new Error(`LLM base_url must be http(s): ${rawUrl}`);
+  }
+  const host = u.hostname.toLowerCase();
+  // Always-blocked: cloud metadata + loopback + link-local
+  const alwaysBlocked =
+    host === "169.254.169.254" ||
+    host === "metadata.google.internal" ||
+    host === "localhost" ||
+    host === "::1" ||
+    host.startsWith("127.") ||
+    host.startsWith("169.254.") ||
+    host.startsWith("fd00:ec2") ;
+  if (alwaysBlocked) {
+    throw new Error(`LLM base_url host is blocked (metadata/loopback): ${host}`);
+  }
+  // Private / cluster-internal — blocked unless operator opts in
+  const allowPrivate = process.env.DOCTOR_ALLOW_PRIVATE_LLM_ENDPOINT === "true";
+  const isPrivate =
+    host.startsWith("10.") ||
+    host.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    host.endsWith(".svc") ||
+    host.endsWith(".svc.cluster.local") ||
+    host.endsWith(".cluster.local") ||
+    host.endsWith(".internal");
+  if (isPrivate && !allowPrivate) {
+    throw new Error(
+      `LLM base_url points to a private/cluster address (${host}); set DOCTOR_ALLOW_PRIVATE_LLM_ENDPOINT=true to permit`,
+    );
+  }
+}
+
 class LLMClient {
   constructor(config) {
     this.provider = config.provider; // openai, anthropic, google, custom
@@ -188,6 +230,8 @@ class LLMClient {
   // --- Zhipu AI (GLM) ---
   async _callZhipu(systemPrompt, userPrompt) {
     const baseUrl = this.baseUrl || "https://api.z.ai/api/coding/paas/v4";
+    // SSRF guard: zhipu base_url may come from server config (default is public).
+    assertSafeLlmEndpoint(baseUrl);
     const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 
     const response = await this._fetch(url, {
@@ -227,6 +271,8 @@ class LLMClient {
   // --- DeepSeek (OpenAI-compatible) ---
   async _callDeepSeek(systemPrompt, userPrompt) {
     const baseUrl = this.baseUrl || "https://api.deepseek.com/v1";
+    // SSRF guard: deepseek base_url may come from server config (default is public).
+    assertSafeLlmEndpoint(baseUrl);
     const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 
     const response = await this._fetch(url, {
@@ -269,6 +315,8 @@ class LLMClient {
       throw new Error("base_url required for custom provider");
     }
 
+    // SSRF guard: custom base_url is fully server-supplied — validate first.
+    assertSafeLlmEndpoint(this.baseUrl);
     const url = `${this.baseUrl.replace(/\/$/, "")}/chat/completions`;
 
     const response = await this._fetch(url, {

@@ -12,11 +12,15 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // CORS
+// These are machine endpoints (k8s probes + agent→server push), not a browser
+// app — so CORS is disabled by default. The SaaS metrics push is the agent
+// initiating outbound requests, which is NOT subject to browser CORS, so this
+// does not affect it. An operator can opt into a specific origin via
+// AGENT_CORS_ORIGIN (e.g. a debugging dashboard) if ever needed.
 app.use(
   cors({
-    origin: "*",
+    origin: process.env.AGENT_CORS_ORIGIN || false,
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["*"],
   }),
 );
 
@@ -1069,12 +1073,24 @@ async function fetchAlerts() {
 // ============================================================================
 
 const apiKeyAuth = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
-  if (!CONFIG.apiKey || apiKey === CONFIG.apiKey) {
-    next();
-  } else {
-    res.status(401).json({ ok: false, error: 'Unauthorized' });
+  // Header-only: accept the key via x-api-key header (no query-string fallback,
+  // which would leak the key into logs/referrers).
+  const apiKey = req.headers['x-api-key'];
+
+  // Fail-closed: when no key is configured, deny access UNLESS the operator has
+  // explicitly opted into unauthenticated metrics. Production agents set
+  // MONIPLE_API_KEY, so the valid-key path below is unchanged for them.
+  if (!CONFIG.apiKey) {
+    if (process.env.ALLOW_UNAUTHENTICATED_METRICS === "true") {
+      return next();
+    }
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
+
+  if (apiKey === CONFIG.apiKey) {
+    return next();
+  }
+  return res.status(401).json({ ok: false, error: 'Unauthorized' });
 };
 
 // ============================================================================

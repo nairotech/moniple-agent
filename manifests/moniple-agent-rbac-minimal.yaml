@@ -1,0 +1,91 @@
+# =============================================================================
+# moniple-agent MINIMAL RBAC (least-privilege variant)
+# =============================================================================
+# WHEN TO USE THIS:
+#   Use this manifest INSTEAD OF `moniple-agent-rbac.yaml` when you run the
+#   agent with AUTO_INSTALL_MONITORING=false and you pre-install the monitoring
+#   stack (VictoriaMetrics/vmagent + kube-state-metrics + node-exporter) and
+#   their RBAC yourself.
+#
+# WHAT IT GRANTS:
+#   Read-only (get/list/watch) access to the cluster objects the agent needs to
+#   collect and summarize metrics. Nothing more.
+#
+# WHAT IT DELIBERATELY DOES NOT GRANT (vs. the full variant):
+#   - NO secrets access (the full variant needs it to reconcile monitoring
+#     secrets during auto-install).
+#   - NO create/update/patch/delete on any resource.
+#   - NO rbac.authorization.k8s.io (no ClusterRole/ClusterRoleBinding/Role
+#     management) — so it cannot bootstrap KSM RBAC and is immune to the
+#     GKE/EKS/AKS escalation-protection requirement.
+#
+# Because it grants no write and no RBAC management, this variant CANNOT
+# auto-install monitoring. If you apply this manifest while
+# AUTO_INSTALL_MONITORING is still true (the default), auto-install will fail
+# with permission errors — set AUTO_INSTALL_MONITORING=false.
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: moniple-agent
+  namespace: moniple
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+    variant: minimal
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: moniple-agent
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+    variant: minimal
+rules:
+  # Core resources - read-only for metric collection
+  - apiGroups: [""]
+    resources:
+      - pods
+      - nodes
+      - namespaces
+      - services
+      - persistentvolumeclaims
+      - configmaps
+      - events
+    verbs: ["get", "list", "watch"]
+  # Node metric/proxy subresources - read-only (some metric reads need these)
+  - apiGroups: [""]
+    resources:
+      - nodes/metrics
+      - nodes/proxy
+    verbs: ["get", "list", "watch"]
+  # Apps resources - read-only for workload summaries
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+      - replicasets
+      - statefulsets
+    verbs: ["get", "list", "watch"]
+  # Metrics endpoints (read-only, for scraping if the agent reads them directly)
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: moniple-agent
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+    variant: minimal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: moniple-agent
+subjects:
+  - kind: ServiceAccount
+    name: moniple-agent
+    namespace: moniple
