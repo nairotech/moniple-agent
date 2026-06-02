@@ -1,2 +1,0 @@
-include:
-  - remote: 'https://gitlab.com/api/v4/projects/${CI_REPO_ID}/repository/files/fi.metrics%2F.base-ci.yml/raw?ref=main&private_token=${CI_REPO_AUTH}&whatever_key=.yml'

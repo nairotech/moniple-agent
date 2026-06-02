@@ -4,5 +4,16 @@ node_modules
 tmp
 dist
 npm-debug.log*
+*.log
 yarn.lock
 .env
+.env.*
+!.env.template
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Local working notes (not part of the public project)
+Claude.md
+CLAUDE.md

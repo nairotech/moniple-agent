@@ -1,19 +1,41 @@
 {
   "name": "moniple-agent",
   "version": "1.0.0",
-  "description": "",
+  "description": "Lightweight in-cluster Kubernetes monitoring agent: collects metrics from Prometheus/VictoriaMetrics, auto-installs a monitoring stack, pushes snapshots to a Moniple server, and runs optional AI-assisted (Doctor) diagnostics.",
   "main": "app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node app.js",
+    "test": "echo \"No tests yet\" && exit 0"
   },
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "kubernetes",
+    "monitoring",
+    "prometheus",
+    "victoria-metrics",
+    "metrics",
+    "observability",
+    "k8s-agent",
+    "moniple"
+  ],
+  "author": "Nairotech",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/nairotech/moniple-agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nairotech/moniple-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nairotech/moniple-agent/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@kubernetes/client-node": "^0.21.0",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
-    "swagger-ui-express": "^5.0.1",
-    "js-yaml": "^4.1.0"
+    "js-yaml": "^4.1.0",
+    "swagger-ui-express": "^5.0.1"
   }
 }
