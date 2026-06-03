@@ -1,5 +1,10 @@
 # Moniple Agent
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Build and Push](https://github.com/nairotech/moniple-agent/actions/workflows/main.yml/badge.svg)](https://github.com/nairotech/moniple-agent/actions/workflows/main.yml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/nairotech/moniple-agent)](https://hub.docker.com/r/nairotech/moniple-agent)
+[![Node.js](https://img.shields.io/badge/node-%E2%89%A520-339933?logo=node.js&logoColor=white)](package.json)
+
 A lightweight, in-cluster Kubernetes monitoring agent. It collects metrics from
 Prometheus or VictoriaMetrics, optionally bootstraps a minimal monitoring stack,
 and pushes compact snapshots to a [Moniple](https://moniple.com) server so they
