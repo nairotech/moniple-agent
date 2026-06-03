@@ -68,9 +68,16 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t nairotech/moniple-agent:latest \
   -t nairotech/moniple-agent:v$TS \
   --push .
+
+# Tag the source commit with the SAME version, so the image is traceable to its
+# exact code (git checkout v$TS) and the git tag matches what agents report.
+git tag "v$TS" && git push origin "v$TS"
 ```
 
-CI (`.github/workflows/main.yml`) does this automatically. Keep it that way.
+CI (`.github/workflows/main.yml`) does both — the image tag **and** the matching
+`v<ts>` git tag — automatically on every push to `main`. Keep it that way.
+(Human-facing GitHub Releases are cut separately at semver milestones, e.g.
+`v1.0.0`.)
 
 ## Submitting changes
 

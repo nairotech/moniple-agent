@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Needed so the build can push a git tag (v<ts>) back to the repo.
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,3 +47,11 @@ jobs:
             nairotech/moniple-agent:main
             nairotech/moniple-agent:latest
             nairotech/moniple-agent:v${{ steps.build_ts.outputs.ts }}
+
+      # Tag the built commit with the SAME v<ts> as the image, so every released
+      # image is traceable to its exact source commit (git checkout v<ts>) and the
+      # git tag matches the version agents report / update_agent pulls.
+      - name: Tag commit with build version
+        run: |
+          git tag "v${{ steps.build_ts.outputs.ts }}"
+          git push origin "v${{ steps.build_ts.outputs.ts }}"
