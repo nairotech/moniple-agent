@@ -5,10 +5,11 @@
  */
 
 class DiagnosticCollector {
-  constructor({ k8sCoreApi, k8sAppsApi, k8sBatchApi, queryPrometheus }) {
+  constructor({ k8sCoreApi, k8sAppsApi, k8sBatchApi, k8sStorageApi, queryPrometheus }) {
     this.k8sCoreApi = k8sCoreApi;
     this.k8sAppsApi = k8sAppsApi;
     this.k8sBatchApi = k8sBatchApi;
+    this.k8sStorageApi = k8sStorageApi;
     this.queryPrometheus = queryPrometheus;
   }
 
@@ -280,22 +281,67 @@ class DiagnosticCollector {
       }
     }
 
-    // Check PVC usage from Prometheus
+    // StorageClass expandability map — lets the LLM know whether an
+    // expand_pvc action is even possible for a given PVC.
+    const expandableClasses = {};
+    if (this.k8sStorageApi) {
+      try {
+        const { body: scList } = await this.k8sStorageApi.listStorageClass();
+        for (const sc of scList.items || []) {
+          expandableClasses[sc.metadata?.name] = sc.allowVolumeExpansion === true;
+        }
+      } catch (e) {
+        // RBAC may not cover storageclasses on old installs — non-fatal.
+      }
+    }
+
+    // PVC metadata lookup for enriching usage findings (size, class).
+    const pvcMeta = {};
+    for (const pvc of pvcs) {
+      const key = `${pvc.metadata?.namespace}/${pvc.metadata?.name}`;
+      const scName = pvc.spec?.storageClassName;
+      pvcMeta[key] = {
+        requestedSize:
+          pvc.status?.capacity?.storage ||
+          pvc.spec?.resources?.requests?.storage,
+        storageClass: scName,
+        expandable: scName ? expandableClasses[scName] === true : false,
+      };
+    }
+
+    // Check PVC usage from Prometheus. Two bands: >90% critical (about to
+    // fill), >80% warning (plan capacity now). Findings carry current size,
+    // storage class and whether the class allows online expansion so the
+    // LLM can propose a concrete expand_pvc action.
     const usageResults = await this.queryPrometheus(
       "sum by (namespace,persistentvolumeclaim) (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes * 100)"
     );
 
     for (const r of usageResults) {
       const value = parseFloat(r.value?.[1] || 0);
-      if (value > 90) {
-        issues.push({
-          type: "PVCNearFull",
-          severity: "critical",
-          pvc: r.metric?.persistentvolumeclaim,
-          namespace: r.metric?.namespace,
-          usagePercent: Math.round(value),
-        });
-      }
+      if (value <= 80) continue;
+      const name = r.metric?.persistentvolumeclaim;
+      const ns = r.metric?.namespace;
+      const meta = pvcMeta[`${ns}/${name}`] || {};
+      issues.push({
+        type: value > 90 ? "PVCNearFull" : "PVCHighUsage",
+        severity: value > 90 ? "critical" : "warning",
+        pvc: name,
+        namespace: ns,
+        usagePercent: Math.round(value),
+        currentSize: meta.requestedSize,
+        storageClass: meta.storageClass,
+        expandable: meta.expandable === true,
+      });
+    }
+
+    // Visibility note: some provisioners (e.g. local-path) never expose
+    // kubelet_volume_stats, so "no usage findings" must not be read as
+    // "all volumes healthy".
+    summary.usageDataAvailable = usageResults.length > 0;
+    if (!summary.usageDataAvailable && pvcs.length > 0) {
+      summary.usageNote =
+        "PVC usage metrics unavailable (provisioner does not expose kubelet_volume_stats) — usage-based findings are not possible for this cluster.";
     }
 
     return { summary, issues };

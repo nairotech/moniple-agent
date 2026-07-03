@@ -66,6 +66,7 @@ function startDiagnosticsEngine() {
       k8sCoreApi: k8sClient.getCoreApi(),
       k8sAppsApi: k8sClient.getAppsApi(),
       k8sBatchApi: k8sClient.getBatchApi(),
+      k8sStorageApi: k8sClient.getStorageApi(),
       queryPrometheus,
       serverUrl: CONFIG.serverUrl,
       apiKey: CONFIG.apiKey,

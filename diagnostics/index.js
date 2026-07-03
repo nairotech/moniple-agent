@@ -32,6 +32,7 @@ const ALLOWED_ACTION_TYPES = new Set([
   "adjust_resources",
   "rollback_deployment",
   "delete_job",
+  "expand_pvc",
   "update_agent",
 ]);
 
@@ -56,11 +57,27 @@ const REMEDIATION_MODE = (() => {
 // Kubernetes resource quantity (e.g. "100m", "256Mi", "1.5", "2Gi").
 const K8S_QUANTITY_REGEX = /^\d+(\.\d+)?(m|Mi|Gi|Ki|M|G|K|Ti|T|P|Pi|n|u)?$/;
 
+// Storage-quantity → bytes for size comparisons (expand_pvc guardrails).
+// Returns null for unparseable input; cpu-style suffixes (m/n/u) make no
+// sense for storage and also return null.
+const STORAGE_UNIT_BYTES = {
+  "": 1,
+  K: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15,
+  Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4, Pi: 1024 ** 5,
+};
+function parseK8sStorageQuantity(q) {
+  if (typeof q !== "string") return null;
+  const m = q.trim().match(/^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|Pi|K|M|G|T|P)?$/);
+  if (!m) return null;
+  return parseFloat(m[1]) * STORAGE_UNIT_BYTES[m[2] || ""];
+}
+
 class DiagnosticsEngine {
   constructor({
     k8sCoreApi,
     k8sAppsApi,
     k8sBatchApi,
+    k8sStorageApi,
     queryPrometheus,
     serverUrl,
     apiKey,
@@ -71,6 +88,7 @@ class DiagnosticsEngine {
       k8sCoreApi,
       k8sAppsApi,
       k8sBatchApi,
+      k8sStorageApi,
       queryPrometheus,
     });
     this.config = null;
@@ -538,6 +556,72 @@ class DiagnosticsEngine {
           resource,
           request: params.request,
           limit: params.limit,
+        };
+      }
+
+      case "expand_pvc": {
+        const k8sStorageApi = this.collector.k8sStorageApi;
+        const newSize = params.new_size;
+        if (typeof newSize !== "string" || !K8S_QUANTITY_REGEX.test(newSize)) {
+          throw new Error("invalid new_size (expected a quantity like 20Gi)");
+        }
+
+        const { body: pvc } =
+          await k8sCoreApi.readNamespacedPersistentVolumeClaim(name, ns);
+        const currentSize = pvc.spec?.resources?.requests?.storage;
+        const currentBytes = parseK8sStorageQuantity(currentSize);
+        const newBytes = parseK8sStorageQuantity(newSize);
+        if (currentBytes === null || newBytes === null) {
+          throw new Error("cannot parse PVC sizes for comparison");
+        }
+        // PVCs can only GROW — a shrink patch is rejected by the API server
+        // anyway, but fail it here with a clear reason.
+        if (newBytes <= currentBytes) {
+          throw new Error(
+            `new_size ${newSize} must be larger than current ${currentSize}`,
+          );
+        }
+        // Cost guardrail: refuse absurd one-step growth (>4x current size).
+        if (newBytes > currentBytes * 4) {
+          throw new Error("new_size exceeds 4x current size — refusing");
+        }
+
+        // The StorageClass must allow expansion or the patch would just
+        // wedge the PVC in a FileSystemResizePending-less limbo.
+        const scName = pvc.spec?.storageClassName;
+        if (scName && k8sStorageApi) {
+          try {
+            const { body: sc } = await k8sStorageApi.readStorageClass(scName);
+            if (sc.allowVolumeExpansion !== true) {
+              throw new Error(
+                `StorageClass ${scName} does not allow volume expansion`,
+              );
+            }
+          } catch (scErr) {
+            // Propagate our own guard error; treat a read failure (RBAC/404)
+            // as non-fatal and let the API server be the final judge.
+            if (String(scErr.message).includes("does not allow")) throw scErr;
+          }
+        }
+
+        await k8sCoreApi.patchNamespacedPersistentVolumeClaim(
+          name,
+          ns,
+          { spec: { resources: { requests: { storage: newSize } } } },
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
+        );
+        return {
+          action: "pvc_expanded",
+          pvc: name,
+          namespace: ns,
+          previousSize: currentSize,
+          newSize,
+          note: "Filesystem resize completes automatically; some provisioners require a pod restart to finish the resize.",
         };
       }
 
