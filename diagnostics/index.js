@@ -94,7 +94,6 @@ class DiagnosticsEngine {
       queryPrometheus,
     });
     this.config = null;
-    this.scheduleTimer = null;
     this.running = false;
   }
 
@@ -299,7 +298,7 @@ class DiagnosticsEngine {
 
       // 4. Push report to server
       await this.pushReport({
-        report_id: reportId,
+        ...(reportId ? { report_id: reportId } : {}),
         diagnostic_data: diagnosticData,
         analysis,
         summary: analysis?.summary || null,
@@ -871,11 +870,8 @@ class DiagnosticsEngine {
       try {
         await this.fetchConfig();
 
-        // Check for pending manual triggers
+        // Check for pending triggers (manual AND server-scheduled)
         await this.checkPendingTrigger();
-
-        // Start auto schedule if enabled
-        this._setupScheduleTimer();
       } catch (err) {
         console.error("[Doctor] Initial config fetch error:", err.message);
       }
@@ -887,9 +883,6 @@ class DiagnosticsEngine {
         await this.fetchConfig();
         await this.checkPendingTrigger();
         await this.pollAndExecuteActions();
-        // Re-evaluate schedule on every refresh so app-side toggles
-        // (auto_enabled / interval_minutes) take effect without agent restart.
-        this._setupScheduleTimer();
       } catch (err) {
         console.error("[Doctor] Config refresh cycle error:", err.message);
       }
@@ -898,76 +891,13 @@ class DiagnosticsEngine {
     console.log("[Doctor] Diagnostics engine started");
   }
 
-  _setupScheduleTimer() {
-    const schedule = this.config?.schedule;
-    const shouldRun = !!(this.config?.enabled && schedule?.auto_enabled);
-    const intervalMin = schedule?.interval_minutes || 30;
-    const intervalMs = intervalMin * 60 * 1000;
-
-    // Idempotency: if signature unchanged, leave the existing timer alone so we
-    // don't reset the fire cadence every 60s config refresh.
-    const sig = shouldRun ? `${intervalMin}` : "off";
-    if (this._scheduleSig === sig) {
-      return;
-    }
-    this._scheduleSig = sig;
-
-    if (this.scheduleTimer) {
-      clearInterval(this.scheduleTimer);
-      this.scheduleTimer = null;
-    }
-    if (this.scheduleFirstTimeout) {
-      clearTimeout(this.scheduleFirstTimeout);
-      this.scheduleFirstTimeout = null;
-    }
-
-    if (!shouldRun) {
-      console.log("[Doctor] Auto-diagnostics disabled");
-      return;
-    }
-
-    // Compute delay until first fire based on last_run_at, so a freshly enabled
-    // schedule fires "interval_minutes after the last run" rather than always
-    // "interval_minutes from now". For brand-new schedules (no last_run_at),
-    // fire after a short bootstrap delay so the change is visible quickly.
-    const lastRunIso = schedule?.last_run_at;
-    let firstDelayMs;
-    if (lastRunIso) {
-      const lastRunMs = Date.parse(lastRunIso);
-      const dueAtMs = lastRunMs + intervalMs;
-      firstDelayMs = Math.max(5000, dueAtMs - Date.now()); // floor 5s
-    } else {
-      firstDelayMs = 5000; // bootstrap: fire ~5s after enable
-    }
-
-    console.log(
-      `[Doctor] Auto-diagnostics scheduled every ${intervalMin} minutes (first fire in ${Math.round(firstDelayMs / 1000)}s)`
-    );
-
-    const fire = async () => {
-      try {
-        await this.runDiagnostic("auto");
-      } catch (err) {
-        console.error("[Doctor] Scheduled diagnostic error:", err.message);
-      }
-    };
-
-    this.scheduleFirstTimeout = setTimeout(async () => {
-      this.scheduleFirstTimeout = null;
-      await fire();
-      this.scheduleTimer = setInterval(fire, intervalMs);
-    }, firstDelayMs);
-  }
-
+  // NOTE: there is deliberately NO agent-local auto-diagnostic timer. The
+  // server's schedule processor is the single scheduler: it enforces the
+  // per-user scan quota and creates an idempotent PENDING report row, which
+  // checkPendingTrigger() above picks up. A local timer would double-scan the
+  // cluster (burning the user's LLM tokens), bypass the quota, and its
+  // report push (report_id: null) is rejected by the server by design.
   stop() {
-    if (this.scheduleTimer) {
-      clearInterval(this.scheduleTimer);
-      this.scheduleTimer = null;
-    }
-    if (this.scheduleFirstTimeout) {
-      clearTimeout(this.scheduleFirstTimeout);
-      this.scheduleFirstTimeout = null;
-    }
     if (this.configRefreshInterval) {
       clearInterval(this.configRefreshInterval);
       this.configRefreshInterval = null;
