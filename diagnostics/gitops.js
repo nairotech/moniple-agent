@@ -15,15 +15,22 @@
  *     reserialize of unrelated content.
  *   - One action = one file = one commit. Staging is always `git add
  *     <exact file>`, never `git add .`/`-A`.
- *
- * This first slice covers target resolution and the surgical edit only (pure
- * filesystem, no git/network yet) — see the git plumbing (clone/commit/PR)
- * added on top of this in the following commit.
+ *   - The PAT is never logged or returned — every surfaced string (thrown
+ *     errors, execution_result.gitops.error, status detail) is passed
+ *     through redact() first.
+ *   - `git` is invoked exclusively via execFile with argv arrays — never a
+ *     string-interpolated shell.
  */
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { execFile } = require("child_process");
 const YAML = require("yaml");
+
+const GIT_TIMEOUT_MS = 30000;
+const REDACTED = "***REDACTED***";
 
 // ---------------------------------------------------------------------------
 // Folder jail
@@ -148,6 +155,25 @@ function walkYamlFiles(repoRoot, folder) {
 
   walk(base);
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// PAT redaction (never let it leave this module)
+// ---------------------------------------------------------------------------
+
+function redact(text, pat) {
+  const str = typeof text === "string" ? text : text == null ? "" : String(text);
+  if (!pat) return str;
+  let result = str.split(pat).join(REDACTED);
+  try {
+    const encoded = encodeURIComponent(pat);
+    if (encoded && encoded !== pat) {
+      result = result.split(encoded).join(REDACTED);
+    }
+  } catch {
+    // ignore
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -539,11 +565,377 @@ function applyEditInPlace(text, edits) {
   return docs.map((d) => String(d)).join("");
 }
 
+// ---------------------------------------------------------------------------
+// git plumbing (execFile only — never a string-interpolated shell)
+// ---------------------------------------------------------------------------
+
+function execGitRaw(args, cwd) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "git",
+      args,
+      {
+        cwd,
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: 20 * 1024 * 1024,
+        // Never let a bad credential hang the agent waiting on a terminal
+        // prompt that can never come in a headless container.
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          err.stdout = stdout;
+          err.stderr = stderr;
+          reject(err);
+        } else {
+          resolve({ stdout, stderr });
+        }
+      },
+    );
+  });
+}
+
+/**
+ * Run git and redact the PAT from any error that escapes — Node's own
+ * "Command failed: ..." error message includes the full argv (which may
+ * embed the credential in the URL), and some git hosts echo the remote URL
+ * verbatim in auth failures. Nothing containing the PAT may leave this
+ * function.
+ */
+async function runGit(args, cwd, pat) {
+  try {
+    return await execGitRaw(args, cwd);
+  } catch (err) {
+    const raw = String(err.stderr || err.message || err);
+    throw new Error(redact(raw, pat));
+  }
+}
+
+function authUrl(repoUrl, pat) {
+  if (!pat) return repoUrl;
+  let u;
+  try {
+    u = new URL(repoUrl);
+  } catch {
+    return repoUrl;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    return repoUrl; // only http(s) remotes are rewritten; ssh/git are left untouched
+  }
+  u.username = "x-access-token";
+  u.password = pat; // WHATWG URL auto percent-encodes
+  return u.toString();
+}
+
+async function getCurrentBranch(repoRoot, pat) {
+  const { stdout } = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot, pat);
+  return stdout.trim();
+}
+
+/**
+ * Shallow sparse clone scoped to cfg.folder into a throwaway temp dir;
+ * guarantees cleanup even if `fn` throws.
+ */
+async function withRepo(cfg, fn) {
+  const folder = sanitizeFolder(cfg.folder);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "moniple-gitops-"));
+  try {
+    const url = authUrl(cfg.repo_url, cfg.pat);
+    const cloneArgs = ["clone", "--depth", "1", "--filter=blob:none", "--sparse"];
+    if (cfg.branch) cloneArgs.push("--branch", cfg.branch);
+    cloneArgs.push(url, tmpDir);
+    await runGit(cloneArgs, undefined, cfg.pat);
+    await runGit(["sparse-checkout", "set", folder], tmpDir, cfg.pat);
+    return await fn(tmpDir);
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup — never let this mask the real result/error
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Preview (scan time — read only, never writes)
+// ---------------------------------------------------------------------------
+
+function buildPreview(repoRoot, folder, action) {
+  const resolved = resolveTarget(repoRoot, folder, action);
+  return {
+    status: resolved.status,
+    file: resolved.file,
+    field_path: resolved.field_path,
+    before: resolved.before,
+    after: resolved.after,
+    note: resolved.note,
+  };
+}
+
+/**
+ * Compute gitops_preview for a batch of actions with a SINGLE clone (plan
+ * amendment 1). Runtime-only actions never touch the repo; if the clone
+ * fails, every eligible action degrades to not_configured (with a redacted
+ * reason) rather than failing the whole scan.
+ */
+async function computePreviews(cfg, actions) {
+  const list = Array.isArray(actions) ? actions : [];
+  const previews = new Array(list.length);
+  const eligible = [];
+
+  for (let i = 0; i < list.length; i++) {
+    const intent = mapActionToTarget(list[i]);
+    if (!intent) {
+      previews[i] = { status: "runtime_only" };
+    } else {
+      eligible.push(i);
+    }
+  }
+
+  if (eligible.length === 0) {
+    return previews; // nothing needs the repo — don't clone at all
+  }
+
+  if (!cfg || !cfg.repo_url || !cfg.folder) {
+    for (const i of eligible) {
+      previews[i] = { status: "not_configured", note: "gitops repository is not configured" };
+    }
+    return previews;
+  }
+
+  try {
+    await withRepo(cfg, async (repoRoot) => {
+      for (const i of eligible) {
+        try {
+          previews[i] = buildPreview(repoRoot, cfg.folder, list[i]);
+        } catch (err) {
+          previews[i] = { status: "not_configured", note: redact(err.message || String(err), cfg.pat) };
+        }
+      }
+    });
+  } catch (err) {
+    const note = redact(err.message || String(err), cfg.pat);
+    for (const i of eligible) {
+      previews[i] = { status: "not_configured", note };
+    }
+  }
+
+  return previews;
+}
+
+// ---------------------------------------------------------------------------
+// Connectivity status
+// ---------------------------------------------------------------------------
+
+async function checkStatus(cfg) {
+  if (!cfg || !cfg.repo_url || !cfg.folder) {
+    return { status: "clone_failed", detail: "gitops repository is not configured" };
+  }
+  let folder;
+  try {
+    folder = sanitizeFolder(cfg.folder);
+  } catch (err) {
+    return { status: "clone_failed", detail: redact(err.message, cfg.pat) };
+  }
+
+  try {
+    await runGit(["ls-remote", authUrl(cfg.repo_url, cfg.pat)], undefined, cfg.pat);
+  } catch (err) {
+    return { status: "auth_failed", detail: redact(err.message, cfg.pat) };
+  }
+
+  try {
+    let exists = false;
+    await withRepo(cfg, async (repoRoot) => {
+      exists = fs.existsSync(path.join(repoRoot, folder));
+    });
+    if (!exists) {
+      return { status: "folder_missing", detail: `folder "${folder}" was not found in the repository` };
+    }
+    return { status: "ok" };
+  } catch (err) {
+    return { status: "clone_failed", detail: redact(err.message, cfg.pat) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Commit message + PR/MR helpers
+// ---------------------------------------------------------------------------
+
+function shortHash(input) {
+  return crypto
+    .createHash("sha256")
+    .update(String(input == null ? "" : input))
+    .digest("hex")
+    .slice(0, 8);
+}
+
+function buildCommitMessage(action) {
+  const name = action.target_name || "resource";
+  const params = action.parameters || {};
+  switch (action.action_type) {
+    case "scale_deployment":
+      return `moniple: scale ${name} to ${params.replicas} replicas`;
+    case "adjust_resources":
+      return `moniple: adjust ${params.resource || "resources"} for ${name}/${params.container || "?"}`;
+    case "expand_pvc":
+      return `moniple: expand PVC ${name} to ${params.new_size}`;
+    case "rollback_deployment":
+      return `moniple: rollback ${name} to previous revision`;
+    default:
+      return `moniple: update ${name}`;
+  }
+}
+
+function detectGitHost(repoUrl) {
+  try {
+    const u = new URL(repoUrl);
+    if (u.hostname === "github.com") return "github";
+    if (u.hostname === "gitlab.com") return "gitlab";
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseRepoPath(repoUrl) {
+  const u = new URL(repoUrl);
+  return u.pathname.replace(/^\/+/, "").replace(/\.git$/, "");
+}
+
+async function openPullRequest(host, cfg, branchName, baseBranch, action) {
+  const repoPath = parseRepoPath(cfg.repo_url);
+  const title = buildCommitMessage(action);
+
+  if (host === "github") {
+    const [owner, repo] = repoPath.split("/");
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
+      method: "POST",
+      headers: {
+        Authorization: `token ${cfg.pat}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "moniple-agent",
+      },
+      body: JSON.stringify({ title, head: branchName, base: baseBranch, body: "Opened automatically by Moniple Doctor." }),
+    });
+    if (!res.ok) throw new Error(`GitHub PR creation failed (HTTP ${res.status})`);
+    const json = await res.json();
+    return json.html_url;
+  }
+
+  if (host === "gitlab") {
+    const projectId = encodeURIComponent(repoPath);
+    const res = await fetch(`https://gitlab.com/api/v4/projects/${projectId}/merge_requests`, {
+      method: "POST",
+      headers: { "PRIVATE-TOKEN": cfg.pat, "Content-Type": "application/json" },
+      body: JSON.stringify({ source_branch: branchName, target_branch: baseBranch, title, description: "Opened automatically by Moniple Doctor." }),
+    });
+    if (!res.ok) throw new Error(`GitLab MR creation failed (HTTP ${res.status})`);
+    const json = await res.json();
+    return json.web_url;
+  }
+
+  throw new Error("unsupported git host");
+}
+
+// ---------------------------------------------------------------------------
+// Approve path: fresh clone, re-resolve, surgical write, commit | PR
+// ---------------------------------------------------------------------------
+
+/**
+ * Best-effort repo edit for an approved action. The live patch has already
+ * been applied by the caller — a failure here never rolls it back, it is
+ * only ever surfaced under execution_result.gitops.
+ */
+async function applyEdit(cfg, action, opts = {}) {
+  if (!cfg || !cfg.repo_url || !cfg.folder) {
+    throw new Error("gitops is not configured for this cluster");
+  }
+  const folder = sanitizeFolder(cfg.folder);
+
+  const intent = mapActionToTarget(action, opts);
+  if (!intent) {
+    throw new Error("action is not eligible for gitops (runtime-only)");
+  }
+  // Rollback with an ambiguous live source (multiple containers): the
+  // executor could not determine which container's image to persist. Skip
+  // without even cloning — the live rollback already happened.
+  if (action.action_type === "rollback_deployment" && !opts.resolvedImage) {
+    throw new Error(
+      "rollback source has multiple containers — cannot determine target container for the repo edit (live rollback already applied)",
+    );
+  }
+
+  return withRepo(cfg, async (repoRoot) => {
+    const resolved = resolveTarget(repoRoot, folder, action, opts);
+    if (resolved.status !== "ready") {
+      throw new Error(`repo target ${resolved.status}${resolved.note ? ": " + resolved.note : ""}`);
+    }
+
+    const absFile = path.join(repoRoot, resolved.file);
+    assertInsideFolder(repoRoot, folder, absFile);
+
+    const originalBranch = await getCurrentBranch(repoRoot, cfg.pat);
+    let pushBranch = originalBranch;
+    if (cfg.delivery_mode === "pr") {
+      pushBranch = `moniple/doctor-${shortHash(action.id)}`;
+      await runGit(["checkout", "-q", "-b", pushBranch], repoRoot, cfg.pat);
+    }
+
+    const original = fs.readFileSync(absFile, "utf8");
+    const updated = applyEditInPlace(original, resolved.edits);
+    fs.writeFileSync(absFile, updated, "utf8");
+
+    // Stage EXACTLY the one edited file — never `git add .`/`-A`.
+    await runGit(["add", "--", resolved.file], repoRoot, cfg.pat);
+
+    const authorName = cfg.author_name || "Moniple Doctor";
+    const authorEmail = cfg.author_email || "doctor@moniple.com";
+    await runGit(
+      ["-c", `user.name=${authorName}`, "-c", `user.email=${authorEmail}`, "commit", "-m", buildCommitMessage(action)],
+      repoRoot,
+      cfg.pat,
+    );
+
+    const { stdout: shaOut } = await runGit(["rev-parse", "HEAD"], repoRoot, cfg.pat);
+    const commitSha = shaOut.trim();
+
+    await runGit(["push", "origin", `HEAD:${pushBranch}`], repoRoot, cfg.pat);
+
+    const base = { file: resolved.file, field: resolved.field_path, before: resolved.before, after: resolved.after };
+
+    if (cfg.delivery_mode !== "pr") {
+      return { ...base, commit_sha: commitSha };
+    }
+
+    const host = detectGitHost(cfg.repo_url);
+    if (!host) {
+      return { ...base, pr_url: null, note: "branch pushed; open PR manually" };
+    }
+    try {
+      const prUrl = await openPullRequest(host, cfg, pushBranch, originalBranch, action);
+      return { ...base, pr_url: prUrl };
+    } catch (err) {
+      return { ...base, pr_url: null, note: redact(`branch pushed; PR creation failed: ${err.message}`, cfg.pat) };
+    }
+  });
+}
+
 module.exports = {
   sanitizeFolder,
   assertInsideFolder,
   walkYamlFiles,
+  redact,
   mapActionToTarget,
   resolveTarget,
   applyEditInPlace,
+  authUrl,
+  withRepo,
+  computePreviews,
+  checkStatus,
+  applyEdit,
+  detectGitHost,
+  buildCommitMessage,
+  shortHash,
 };
