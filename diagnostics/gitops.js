@@ -12,12 +12,23 @@
  *     <repoRoot>/<folder>. Never touches anything outside it.
  *   - Minimal diff: only the action's own field(s) are changed, using the
  *     `yaml` Document API (comment/order preserving) — never a full
- *     reserialize of unrelated content.
+ *     reserialize of unrelated content. Multi-document (`---`-separated)
+ *     files are edited by an explicit, resolveTarget-derived document index
+ *     (docIndex) — never a field-path-depth guess, which cannot tell two
+ *     same-shaped candidate documents apart.
  *   - One action = one file = one commit. Staging is always `git add
  *     <exact file>`, never `git add .`/`-A`.
+ *   - The PAT is never embedded in a URL passed to git (argv is visible via
+ *     /proc/cmdline and git persists the remote URL into the clone's
+ *     `.git/config`). Every network-touching git invocation instead gets the
+ *     credential via an ephemeral, per-invocation `-c
+ *     http.extraHeader=Authorization: Basic ...` (see gitAuthArgs) against a
+ *     CLEAN url.
  *   - The PAT is never logged or returned — every surfaced string (thrown
  *     errors, execution_result.gitops.error, status detail) is passed
- *     through redact() first.
+ *     through redact() first, which strips the raw PAT and every encoded
+ *     form it can appear in (URI-encoded, URL-userinfo-encoded, Basic
+ *     base64).
  *   - `git` is invoked exclusively via execFile with argv arrays — never a
  *     string-interpolated shell.
  */
@@ -26,7 +37,9 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const { execFile } = require("child_process");
+// Looked up as `cp.execFile` at call time (not destructured here) so tests
+// can substitute it — see execGitRaw.
+const cp = require("child_process");
 const YAML = require("yaml");
 
 const GIT_TIMEOUT_MS = 30000;
@@ -59,6 +72,13 @@ function sanitizeFolder(folder) {
     }
     if (seg === "..") {
       throw new Error("folder must not contain '..' segments");
+    }
+    if (seg.startsWith("-")) {
+      // A segment starting with '-' could be misread as a git option by a
+      // downstream invocation (e.g. `sparse-checkout set <folder>`) rather
+      // than a path — reject outright rather than relying solely on the
+      // `--` separator we also add at the call site (defense in depth).
+      throw new Error("folder must not contain a segment starting with '-'");
     }
   }
   return segments.join("/");
@@ -169,6 +189,32 @@ function redact(text, pat) {
     const encoded = encodeURIComponent(pat);
     if (encoded && encoded !== pat) {
       result = result.split(encoded).join(REDACTED);
+    }
+  } catch {
+    // ignore
+  }
+  // The WHATWG URL userinfo percent-encoder (what a `https://user:PAT@host`
+  // remote URL would use) escapes a DIFFERENT character set than
+  // encodeURIComponent — e.g. it leaves '+' unescaped — so a pat containing
+  // characters like '+' can appear in a differently-encoded form that the
+  // check above misses. Strip that exact form too.
+  try {
+    const dummy = new URL("https://x@y.invalid");
+    dummy.password = pat;
+    const urlEncoded = dummy.password;
+    if (urlEncoded && urlEncoded !== pat) {
+      result = result.split(urlEncoded).join(REDACTED);
+    }
+  } catch {
+    // ignore
+  }
+  // The Basic-auth header value injected via `-c http.extraHeader=...` for
+  // network-touching git invocations (see gitAuthArgs) must never survive
+  // into a surfaced error either.
+  try {
+    const basic = Buffer.from(`x-access-token:${pat}`).toString("base64");
+    if (basic) {
+      result = result.split(basic).join(REDACTED);
     }
   } catch {
     // ignore
@@ -384,7 +430,15 @@ function resolveTarget(repoRoot, folder, action, opts = {}) {
     } catch {
       continue;
     }
-    for (const doc of docs) {
+    // Track each doc's ordinal position within ITS OWN file's parsed
+    // document array (`docIndex`) — this is threaded all the way through to
+    // applyEdit so it can tell applyEditInPlace exactly which `---`-separated
+    // document to edit, instead of applyEditInPlace re-guessing by field-path
+    // depth alone (which cannot distinguish two docs that both happen to
+    // resolve the same field, e.g. two Deployments both with spec.replicas —
+    // see FINDING 1 in the 2026-07-08 review).
+    for (let docIndex = 0; docIndex < docs.length; docIndex++) {
+      const doc = docs[docIndex];
       let plain;
       try {
         plain = doc.toJS();
@@ -404,6 +458,7 @@ function resolveTarget(repoRoot, folder, action, opts = {}) {
         doc,
         plain,
         text,
+        docIndex,
       });
     }
   }
@@ -503,6 +558,10 @@ function resolveTarget(repoRoot, folder, action, opts = {}) {
     before,
     after,
     edits: concreteLeaves.map((l) => ({ path: l.path, value: l.after })),
+    // Internal only (not part of the gitops_preview shape sent to the
+    // server/app — buildPreview whitelists its own fields) — consumed only
+    // by applyEdit to tell applyEditInPlace exactly which document to edit.
+    docIndex: match.docIndex,
   };
 }
 
@@ -545,8 +604,18 @@ function pickTargetDocIndex(docs, edits) {
  * order and formatting elsewhere are preserved. Handles multi-document
  * (`---`-separated) files by editing only the doc the edits actually belong
  * to; every other document is round-tripped byte-for-byte.
+ *
+ * `docIndex`, when provided (as it always is from applyEdit — see
+ * resolveTarget), identifies the EXACT document (by ordinal position in this
+ * same text's `parseAllDocuments` array) that resolveTarget already matched
+ * by kind+name+namespace. It is used directly and is NOT re-derived — the
+ * path-depth heuristic (`pickTargetDocIndex`) cannot distinguish two
+ * candidate docs that both happen to resolve the same field path (e.g. two
+ * Deployments both having spec.replicas) and would silently edit the wrong
+ * one (see FINDING 1, 2026-07-08 review). The heuristic is kept ONLY as a
+ * fallback for callers that don't have a resolveTarget-derived docIndex.
  */
-function applyEditInPlace(text, edits) {
+function applyEditInPlace(text, edits, docIndex) {
   if (!Array.isArray(edits) || edits.length === 0) {
     throw new Error("applyEditInPlace requires at least one edit");
   }
@@ -554,10 +623,20 @@ function applyEditInPlace(text, edits) {
   if (docs.length === 0) {
     throw new Error("no YAML documents found in the given text");
   }
-  const targetIndex = docs.length === 1 ? 0 : pickTargetDocIndex(docs, edits);
-  if (targetIndex === -1) {
-    throw new Error("could not determine which document to edit");
+
+  let targetIndex;
+  if (docIndex === undefined || docIndex === null) {
+    targetIndex = docs.length === 1 ? 0 : pickTargetDocIndex(docs, edits);
+    if (targetIndex === -1) {
+      throw new Error("could not determine which document to edit");
+    }
+  } else {
+    if (!Number.isInteger(docIndex) || docIndex < 0 || docIndex >= docs.length) {
+      throw new Error(`docIndex ${docIndex} is out of range for ${docs.length} document(s) in this file`);
+    }
+    targetIndex = docIndex;
   }
+
   const target = docs[targetIndex];
   for (const edit of edits) {
     target.setIn(edit.path, edit.value);
@@ -571,7 +650,7 @@ function applyEditInPlace(text, edits) {
 
 function execGitRaw(args, cwd) {
   return new Promise((resolve, reject) => {
-    execFile(
+    cp.execFile(
       "git",
       args,
       {
@@ -611,6 +690,17 @@ async function runGit(args, cwd, pat) {
   }
 }
 
+/**
+ * Build an https URL with the PAT embedded as userinfo
+ * (`https://x-access-token:<pat>@host/...`).
+ *
+ * SECURITY: kept exported for backward compatibility / direct unit testing
+ * only. NEVER pass the result of this function to a git subprocess (argv or
+ * otherwise) — that is exactly what put the PAT in /proc/cmdline and
+ * persisted it into the cloned repo's .git/config (FINDING 3, 2026-07-08
+ * review). Every git invocation must use the CLEAN cfg.repo_url plus
+ * gitAuthArgs(cfg.pat) instead.
+ */
 function authUrl(repoUrl, pat) {
   if (!pat) return repoUrl;
   let u;
@@ -627,6 +717,32 @@ function authUrl(repoUrl, pat) {
   return u.toString();
 }
 
+/**
+ * The HTTP Basic-auth header value for a PAT, in the exact form git needs
+ * for `-c http.extraHeader=...`. Returns null when there's no pat (nothing
+ * to inject — e.g. local/file:// remotes, or ssh remotes using agent auth).
+ */
+function gitAuthHeaderValue(pat) {
+  if (!pat) return null;
+  return `Authorization: Basic ${Buffer.from(`x-access-token:${pat}`).toString("base64")}`;
+}
+
+/**
+ * The `-c http.extraHeader=...` argv prefix that authenticates a single git
+ * invocation without ever putting the credential in a URL. This is
+ * per-invocation and ephemeral: it lives only in this process's argv for the
+ * duration of the call, and is NEVER written to any `.git/config` (unlike
+ * embedding the PAT in the remote URL, which git persists to
+ * `.git/config` on clone/remote-add). Use on every network-touching git
+ * invocation (clone, ls-remote, push, fetch, and sparse-checkout — the
+ * latter can trigger a lazy blob fetch against a `--filter=blob:none`
+ * partial clone).
+ */
+function gitAuthArgs(pat) {
+  const header = gitAuthHeaderValue(pat);
+  return header ? ["-c", `http.extraHeader=${header}`] : [];
+}
+
 async function getCurrentBranch(repoRoot, pat) {
   const { stdout } = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot, pat);
   return stdout.trim();
@@ -634,18 +750,25 @@ async function getCurrentBranch(repoRoot, pat) {
 
 /**
  * Shallow sparse clone scoped to cfg.folder into a throwaway temp dir;
- * guarantees cleanup even if `fn` throws.
+ * guarantees cleanup even if `fn` throws. The remote URL passed to git is
+ * always the CLEAN cfg.repo_url — the PAT is injected per-invocation via a
+ * `-c http.extraHeader=...` Basic-auth header (gitAuthArgs) instead of being
+ * embedded in the URL, so it is never written into the clone's .git/config
+ * nor visible there after the fact (FINDING 3).
  */
 async function withRepo(cfg, fn) {
   const folder = sanitizeFolder(cfg.folder);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "moniple-gitops-"));
   try {
-    const url = authUrl(cfg.repo_url, cfg.pat);
-    const cloneArgs = ["clone", "--depth", "1", "--filter=blob:none", "--sparse"];
+    const authArgs = gitAuthArgs(cfg.pat);
+    const cloneArgs = [...authArgs, "clone", "--depth", "1", "--filter=blob:none", "--sparse"];
     if (cfg.branch) cloneArgs.push("--branch", cfg.branch);
-    cloneArgs.push(url, tmpDir);
+    cloneArgs.push(cfg.repo_url, tmpDir);
     await runGit(cloneArgs, undefined, cfg.pat);
-    await runGit(["sparse-checkout", "set", folder], tmpDir, cfg.pat);
+    // `--` before the folder: sanitizeFolder already rejects a leading '-'
+    // segment, but this keeps git from ever treating the argument as an
+    // option even under a future relaxation (FINDING 5, defense in depth).
+    await runGit([...authArgs, "sparse-checkout", "set", "--", folder], tmpDir, cfg.pat);
     return await fn(tmpDir);
   } finally {
     try {
@@ -739,7 +862,10 @@ async function checkStatus(cfg) {
   }
 
   try {
-    await runGit(["ls-remote", authUrl(cfg.repo_url, cfg.pat)], undefined, cfg.pat);
+    // Clean URL + header (FINDING 3) — never authUrl(): ls-remote's argv is
+    // process-visible, and an auth-embedded URL here would be pure argv
+    // exposure with no offsetting benefit (no repo is cloned/persisted).
+    await runGit([...gitAuthArgs(cfg.pat), "ls-remote", cfg.repo_url], undefined, cfg.pat);
   } catch (err) {
     return { status: "auth_failed", detail: redact(err.message, cfg.pat) };
   }
@@ -876,6 +1002,25 @@ async function applyEdit(cfg, action, opts = {}) {
     const absFile = path.join(repoRoot, resolved.file);
     assertInsideFolder(repoRoot, folder, absFile);
 
+    // resolved.docIndex pins the EXACT document (within this file) that
+    // resolveTarget matched by kind+name+namespace — applyEditInPlace uses
+    // it directly instead of re-guessing by field-path depth, which cannot
+    // tell apart two candidate docs that resolve the same field (FINDING 1).
+    const original = fs.readFileSync(absFile, "utf8");
+    const updated = applyEditInPlace(original, resolved.edits, resolved.docIndex);
+
+    const base = { file: resolved.file, field: resolved.field_path, before: resolved.before, after: resolved.after };
+
+    // No-op guard: the live patch may have already converged the cluster
+    // (and thus the desired repo value) to what's already committed — e.g.
+    // re-approving an action, or the action's target value happens to match
+    // the repo already. `git commit` would fail with "nothing to commit"
+    // and surface as a spurious error; treat an identical serialization as
+    // success instead, before touching the working tree/branch/git at all.
+    if (updated === original) {
+      return { ...base, commit_sha: null, note: "repo already at desired value — no commit needed" };
+    }
+
     const originalBranch = await getCurrentBranch(repoRoot, cfg.pat);
     let pushBranch = originalBranch;
     if (cfg.delivery_mode === "pr") {
@@ -883,8 +1028,6 @@ async function applyEdit(cfg, action, opts = {}) {
       await runGit(["checkout", "-q", "-b", pushBranch], repoRoot, cfg.pat);
     }
 
-    const original = fs.readFileSync(absFile, "utf8");
-    const updated = applyEditInPlace(original, resolved.edits);
     fs.writeFileSync(absFile, updated, "utf8");
 
     // Stage EXACTLY the one edited file — never `git add .`/`-A`.
@@ -901,9 +1044,9 @@ async function applyEdit(cfg, action, opts = {}) {
     const { stdout: shaOut } = await runGit(["rev-parse", "HEAD"], repoRoot, cfg.pat);
     const commitSha = shaOut.trim();
 
-    await runGit(["push", "origin", `HEAD:${pushBranch}`], repoRoot, cfg.pat);
-
-    const base = { file: resolved.file, field: resolved.field_path, before: resolved.before, after: resolved.after };
+    // Clean `origin` (no embedded credential, per FINDING 3) needs the auth
+    // header on this invocation too — it isn't picked up from .git/config.
+    await runGit([...gitAuthArgs(cfg.pat), "push", "origin", `HEAD:${pushBranch}`], repoRoot, cfg.pat);
 
     if (cfg.delivery_mode !== "pr") {
       return { ...base, commit_sha: commitSha };
@@ -931,6 +1074,8 @@ module.exports = {
   resolveTarget,
   applyEditInPlace,
   authUrl,
+  gitAuthHeaderValue,
+  gitAuthArgs,
   withRepo,
   computePreviews,
   checkStatus,

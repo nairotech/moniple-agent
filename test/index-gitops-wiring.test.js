@@ -185,3 +185,94 @@ test("_maybeReportGitopsStatus: gitops being removed is handled without throwing
   await assert.doesNotReject(engine._maybeReportGitopsStatus());
   assert.strictEqual(engine._gitopsSig, null);
 });
+
+// ---------------------------------------------------------------------------
+// fetchConfig: fire-and-forget GitOps status check (FINDING 7, 2026-07-08
+// review) — _maybeReportGitopsStatus does a real ls-remote + sparse clone
+// (up to ~30-60s against a slow/unreachable host) and must never block
+// fetchConfig, which is on the hot path of the 60s poll loop.
+// ---------------------------------------------------------------------------
+
+test("fetchConfig: resolves without waiting for _maybeReportGitopsStatus to finish (fire-and-forget)", async () => {
+  const engine = makeEngine();
+  engine.serverUrl = "http://fake-server.test";
+  engine.apiKey = "fake-key";
+
+  let statusCheckStarted = false;
+  let statusCheckFinished = false;
+  // Stub out the (normally git-touching) status check with a slow promise —
+  // deterministic and fast to run, but still long enough that "fetchConfig
+  // returned before this resolved" is an unambiguous, non-flaky assertion.
+  engine._maybeReportGitopsStatus = () =>
+    new Promise((resolve) => {
+      statusCheckStarted = true;
+      setTimeout(() => {
+        statusCheckFinished = true;
+        resolve();
+      }, 300);
+    });
+
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      ok: true,
+      data: { enabled: true, gitops: { repo_url: "https://example.com/org/repo.git", folder: "base" } },
+    }),
+  });
+
+  try {
+    const t0 = Date.now();
+    const config = await engine.fetchConfig();
+    const elapsed = Date.now() - t0;
+
+    assert.ok(config, "fetchConfig should resolve with the config");
+    assert.ok(statusCheckStarted, "the gitops status check should have been kicked off");
+    assert.strictEqual(statusCheckFinished, false, "fetchConfig must not wait for the slow status check to finish");
+    assert.ok(elapsed < 100, `fetchConfig should return almost immediately, took ${elapsed}ms`);
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  // Let the background check actually finish before the file exits, so it
+  // doesn't leak a dangling timer / produce a late unhandled rejection.
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.ok(statusCheckFinished, "the background status check should eventually complete on its own");
+});
+
+test("fetchConfig: a synchronous throw inside _maybeReportGitopsStatus never becomes an unhandled rejection", async () => {
+  const engine = makeEngine();
+  engine.serverUrl = "http://fake-server.test";
+  engine.apiKey = "fake-key";
+
+  // Simulate _gitopsHash (or anything else in the synchronous prefix of
+  // _maybeReportGitopsStatus) throwing — fetchConfig's `void ...catch(...)`
+  // wiring must still swallow it rather than crashing the process.
+  engine._maybeReportGitopsStatus = async () => {
+    throw new Error("boom from status check");
+  };
+
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({ ok: true, data: { enabled: true, gitops: { repo_url: "https://example.com/org/repo.git", folder: "base" } } }),
+  });
+
+  let unhandled = null;
+  const onUnhandledRejection = (err) => {
+    unhandled = err;
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+
+  try {
+    const config = await engine.fetchConfig();
+    assert.ok(config, "fetchConfig should still resolve with the config despite the background failure");
+    // Give the fire-and-forget rejection a tick to surface if it were going
+    // to become unhandled.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(unhandled, null, "the background failure must never become an unhandled rejection");
+  } finally {
+    global.fetch = originalFetch;
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+  }
+});

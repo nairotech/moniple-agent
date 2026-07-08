@@ -118,8 +118,15 @@ class DiagnosticsEngine {
         this.config = result.data;
         // Best-effort: report GitOps connectivity whenever the gitops block
         // changes (including the very first time it appears). Never allowed
-        // to fail a config fetch.
-        await this._maybeReportGitopsStatus();
+        // to fail — or BLOCK — a config fetch: this can take up to ~60s
+        // (ls-remote + a sparse clone) and fetchConfig is on the hot path of
+        // the 60s poll loop (startSchedule) and the pending-action poll, so
+        // it's fired-and-forgotten rather than awaited. The `.catch` here is
+        // a defensive backstop only — _maybeReportGitopsStatus already
+        // wraps its own git-touching work in try/catch internally.
+        void this._maybeReportGitopsStatus().catch((err) => {
+          console.error("[Doctor] GitOps status check crashed unexpectedly:", err && err.message);
+        });
         return this.config;
       }
     } catch (err) {

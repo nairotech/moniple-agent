@@ -162,6 +162,22 @@ test("sanitizeFolder: is idempotent on an already-clean path", () => {
   assert.strictEqual(gitops.sanitizeFolder("clusters/prod"), "clusters/prod");
 });
 
+// FINDING 5 (2026-07-08 review): a segment starting with '-' could be
+// misread as a git option by a downstream invocation (e.g.
+// `sparse-checkout set <folder>`) rather than a path.
+test("sanitizeFolder: rejects a folder whose first segment starts with '-'", () => {
+  assert.throws(() => gitops.sanitizeFolder("-x"));
+  assert.throws(() => gitops.sanitizeFolder("--upload-pack=evil"));
+});
+
+test("sanitizeFolder: rejects a folder whose non-first segment starts with '-'", () => {
+  assert.throws(() => gitops.sanitizeFolder("clusters/-rf"));
+});
+
+test("sanitizeFolder: a segment merely containing (not starting with) '-' is fine", () => {
+  assert.strictEqual(gitops.sanitizeFolder("clusters/prod-eu-west"), "clusters/prod-eu-west");
+});
+
 // ---------------------------------------------------------------------------
 // assertInsideFolder
 // ---------------------------------------------------------------------------
@@ -312,6 +328,182 @@ test("resolveTarget: runtime_only for a non-eligible action type", () => {
   });
   assert.strictEqual(result.status, "runtime_only");
 });
+
+// ---------------------------------------------------------------------------
+// resolveTarget + applyEditInPlace — multi-doc docIndex threading
+// (FINDING 1 / FINDING 6, 2026-07-08 review): a multi-doc file previously
+// had its edit applied to the WRONG document whenever the depth-heuristic in
+// applyEditInPlace tied (e.g. two Deployments that both resolve
+// spec.replicas) — reviewer reproduced targeting app-backend actually
+// scaling app-frontend. resolveTarget now records which document (by
+// ordinal index within the file) it matched by kind+name+namespace, and
+// applyEdit threads that docIndex into applyEditInPlace so it is used
+// directly instead of re-derived by the ambiguous heuristic.
+// ---------------------------------------------------------------------------
+
+const FRONTEND_DEPLOYMENT_YAML = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-frontend
+  namespace: app-frontend
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: app
+          image: repo/frontend:v1
+`;
+
+const STATEFULSET_SAME_NAME_YAML = `apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: app-backend
+  namespace: app-backend
+spec:
+  replicas: 2
+  serviceName: app-backend
+  template:
+    spec:
+      containers:
+        - name: app
+          image: repo/statefulset:v1
+`;
+
+test("resolveTarget: two Deployments in one file — records the matched doc's ordinal index (docIndex), not just its file", () => {
+  const combined = FRONTEND_DEPLOYMENT_YAML + "---\n" + DEPLOYMENT_YAML; // app-frontend is doc 0, app-backend is doc 1
+  const repoRoot = makeFixtureRepo({ "base/multi.yaml": combined });
+  const action = {
+    action_type: "scale_deployment",
+    target_kind: "Deployment",
+    target_name: "app-backend",
+    target_namespace: "app-backend",
+    parameters: { replicas: 3 },
+  };
+  const resolved = gitops.resolveTarget(repoRoot, "base", action);
+  assert.strictEqual(resolved.status, "ready");
+  assert.strictEqual(resolved.file, "base/multi.yaml");
+  assert.strictEqual(resolved.docIndex, 1);
+});
+
+test("resolveTarget + applyEditInPlace (FINDING 1 regression, case a): two Deployments in one file — scaling app-backend changes ONLY app-backend's doc; app-frontend's doc is byte-identical", () => {
+  const combined = FRONTEND_DEPLOYMENT_YAML + "---\n" + DEPLOYMENT_YAML;
+  const repoRoot = makeFixtureRepo({ "base/multi.yaml": combined });
+  const action = {
+    action_type: "scale_deployment",
+    target_kind: "Deployment",
+    target_name: "app-backend",
+    target_namespace: "app-backend",
+    parameters: { replicas: 3 },
+  };
+  const resolved = gitops.resolveTarget(repoRoot, "base", action);
+  assert.strictEqual(resolved.status, "ready");
+
+  const updated = gitops.applyEditInPlace(combined, resolved.edits, resolved.docIndex);
+  const [frontendPart, backendPart] = updated.split("---\n");
+
+  // Proof line 1: the correct doc (app-backend) actually changed.
+  assert.ok(backendPart.includes("replicas: 3 # keep this comment"));
+  assert.ok(!backendPart.includes("replicas: 2"));
+  // Proof line 2: the other doc (app-frontend) is byte-identical to its
+  // original text — nothing else was touched.
+  assert.strictEqual(frontendPart, FRONTEND_DEPLOYMENT_YAML);
+  // Proof line 3: exactly one line differs across the WHOLE file.
+  const changedLines = diffLineCount(combined, updated);
+  assert.strictEqual(changedLines, 1);
+});
+
+test("resolveTarget + applyEditInPlace (FINDING 1 regression, case b): a same-named StatefulSet BEFORE the target Deployment in one file — the Deployment (not the StatefulSet) is edited", () => {
+  // Both docs are named "app-backend" (a StatefulSet and headless-service
+  // style co-located Deployment sharing a name is a common real-world
+  // pattern) and BOTH have a top-level spec.replicas — so the OLD
+  // depth-heuristic (which ignores kind/name entirely) would score them
+  // identically and silently edit the first (StatefulSet) doc instead.
+  const combined = STATEFULSET_SAME_NAME_YAML + "---\n" + DEPLOYMENT_YAML;
+  const repoRoot = makeFixtureRepo({ "base/multi.yaml": combined });
+  const action = {
+    action_type: "scale_deployment",
+    target_kind: "Deployment",
+    target_name: "app-backend",
+    target_namespace: "app-backend",
+    parameters: { replicas: 4 },
+  };
+  const resolved = gitops.resolveTarget(repoRoot, "base", action);
+  assert.strictEqual(resolved.status, "ready");
+  assert.strictEqual(resolved.docIndex, 1); // the Deployment is the 2nd doc
+
+  const updated = gitops.applyEditInPlace(combined, resolved.edits, resolved.docIndex);
+  const [statefulSetPart, deploymentPart] = updated.split("---\n");
+
+  assert.strictEqual(statefulSetPart, STATEFULSET_SAME_NAME_YAML, "the StatefulSet doc must be untouched");
+  assert.ok(deploymentPart.includes("replicas: 4 # keep this comment"));
+  assert.ok(!deploymentPart.includes("replicas: 2"));
+});
+
+test("applyEditInPlace: an explicit docIndex is used directly even when the depth heuristic would tie on the wrong (first) doc", () => {
+  // Both docs are structurally identical (Deployment + spec.replicas) so
+  // pickTargetDocIndex's depth score ties and — pre-fix — always resolved to
+  // doc 0. Passing docIndex=1 explicitly must still edit doc 1.
+  const combined = FRONTEND_DEPLOYMENT_YAML + "---\n" + DEPLOYMENT_YAML;
+  const updated = gitops.applyEditInPlace(combined, [{ path: ["spec", "replicas"], value: 9 }], 1);
+  const [frontendPart, backendPart] = updated.split("---\n");
+  assert.strictEqual(frontendPart, FRONTEND_DEPLOYMENT_YAML);
+  assert.ok(backendPart.includes("replicas: 9 # keep this comment"));
+});
+
+test("applyEditInPlace: an out-of-range docIndex throws rather than silently falling back to the heuristic", () => {
+  assert.throws(() => gitops.applyEditInPlace(DEPLOYMENT_YAML, [{ path: ["spec", "replicas"], value: 3 }], 5), /out of range/);
+  assert.throws(() => gitops.applyEditInPlace(DEPLOYMENT_YAML, [{ path: ["spec", "replicas"], value: 3 }], -1), /out of range/);
+});
+
+test("applyEditInPlace: omitting docIndex still falls back to the depth heuristic (backward compat for direct callers)", () => {
+  // Single-doc file: heuristic and explicit docIndex=0 must agree.
+  const withIndex = gitops.applyEditInPlace(DEPLOYMENT_YAML, [{ path: ["spec", "replicas"], value: 7 }], 0);
+  const withoutIndex = gitops.applyEditInPlace(DEPLOYMENT_YAML, [{ path: ["spec", "replicas"], value: 7 }]);
+  assert.strictEqual(withIndex, withoutIndex);
+});
+
+// FINDING 6: the `yaml` lib normalizes the whitespace run before an inline
+// comment down to a single space on serialization — even mutating the
+// existing scalar node's `.value` in place (not just via a fresh setIn)
+// exhibits this, so it isn't something applyEditInPlace's own code
+// introduces or can cheaply prevent. Accept it (per the finding), but lock
+// in the behavior and prove NOTHING else on the line (or file) changes.
+test("applyEditInPlace: a multi-space inline comment gap collapses to a single space (known yaml-lib limitation) — only the edited line changes, comment text is preserved", () => {
+  const text = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-backend
+spec:
+  replicas: 5   # x
+  template:
+    spec:
+      containers:
+        - name: app
+          image: repo/app:v1
+`;
+  const result = gitops.applyEditInPlace(text, [{ path: ["spec", "replicas"], value: 3 }]);
+
+  const originalLines = text.split("\n");
+  const resultLines = result.split("\n");
+  const changedIdx = [];
+  for (let i = 0; i < originalLines.length; i++) {
+    if (originalLines[i] !== resultLines[i]) changedIdx.push(i);
+  }
+  assert.deepStrictEqual(changedIdx, [originalLines.indexOf("  replicas: 5   # x")], "exactly one line must change");
+  assert.strictEqual(resultLines[changedIdx[0]], "  replicas: 3 # x", "value updates, comment TEXT is preserved (spacing collapses — accepted)");
+});
+
+function diffLineCount(a, b) {
+  const linesA = a.split("\n");
+  const linesB = b.split("\n");
+  const max = Math.max(linesA.length, linesB.length);
+  let count = 0;
+  for (let i = 0; i < max; i++) {
+    if (linesA[i] !== linesB[i]) count++;
+  }
+  return count;
+}
 
 // ---------------------------------------------------------------------------
 // resolveTarget — adjust_resources (dual leaves, amendment 3)
