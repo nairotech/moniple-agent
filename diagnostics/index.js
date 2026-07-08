@@ -3,9 +3,11 @@
  * Ties together: config fetch → collect → LLM analyze → push report → poll actions → execute
  */
 
+const crypto = require("crypto");
 const { DiagnosticCollector } = require("./collector");
 const { LLMClient } = require("./llm-client");
 const { getSystemPrompt, getUserPrompt } = require("./prompts");
+const gitops = require("./gitops");
 
 // ---------------------------------------------------------------------------
 // Remediation guardrails (security)
@@ -114,12 +116,65 @@ class DiagnosticsEngine {
       const result = await response.json();
       if (result.ok) {
         this.config = result.data;
+        // Best-effort: report GitOps connectivity whenever the gitops block
+        // changes (including the very first time it appears). Never allowed
+        // to fail a config fetch.
+        await this._maybeReportGitopsStatus();
         return this.config;
       }
     } catch (err) {
       console.error("[Doctor] Failed to fetch config:", err.message);
     }
     return null;
+  }
+
+  // --- GitOps status reporting (config-change-triggered) ---
+
+  _gitopsHash(gitopsCfg) {
+    if (!gitopsCfg) return null;
+    return crypto.createHash("sha256").update(JSON.stringify(gitopsCfg)).digest("hex");
+  }
+
+  async _maybeReportGitopsStatus() {
+    const gitopsCfg = this.config?.gitops || null;
+    const sig = this._gitopsHash(gitopsCfg);
+
+    // Idempotency: only re-check when the gitops block actually changed
+    // (including its first appearance) — never on every 60s config refresh.
+    if (sig === this._gitopsSig) {
+      return;
+    }
+    this._gitopsSig = sig;
+
+    if (!gitopsCfg) {
+      return; // gitops removed/disabled — nothing to report
+    }
+
+    try {
+      const status = await gitops.checkStatus(gitopsCfg);
+      await this._postGitopsStatus(status);
+    } catch (err) {
+      // Defensive: checkStatus() never throws by design, but redact anyway —
+      // nothing derived from a gitops config may be logged unredacted.
+      console.error("[Doctor] GitOps status check failed:", gitops.redact(err.message, gitopsCfg.pat));
+    }
+  }
+
+  async _postGitopsStatus(status) {
+    if (!this.serverUrl || !this.apiKey) return;
+
+    try {
+      await fetch(`${this.serverUrl}/api/v1/agent/doctor/gitops/status`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({ status: status.status, detail: status.detail }),
+      });
+    } catch (err) {
+      console.error("[Doctor] Failed to report GitOps status:", err.message);
+    }
   }
 
   // --- Diagnostic Cycle ---
@@ -216,6 +271,22 @@ class DiagnosticsEngine {
               }
             }
           }
+        }
+      }
+
+      // 3.5 GitOps previews (best-effort, single clone for the whole batch —
+      // never fails the scan; absent entirely when gitops isn't configured).
+      if (this.config?.gitops && this.config.gitops.enabled !== false && actions.length) {
+        try {
+          const previews = await gitops.computePreviews(this.config.gitops, actions);
+          actions.forEach((action, i) => {
+            action.gitops_preview = previews[i];
+          });
+        } catch (err) {
+          // Defensive: computePreviews() never throws by design, but redact
+          // anyway — nothing derived from a gitops config may be logged
+          // unredacted. Never fails the scan either way.
+          console.error("[Doctor] GitOps preview computation failed:", gitops.redact(err.message, this.config.gitops.pat));
         }
       }
 
@@ -470,7 +541,9 @@ class DiagnosticsEngine {
           undefined,
           { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
         );
-        return { action: "deployment_scaled", deployment: name, namespace: ns, replicas };
+        const result = { action: "deployment_scaled", deployment: name, namespace: ns, replicas };
+        await this._applyGitopsEdit(result, action);
+        return result;
       }
 
       case "delete_pod": {
@@ -548,7 +621,7 @@ class DiagnosticsEngine {
           undefined,
           { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
         );
-        return {
+        const result = {
           action: "resources_adjusted",
           deployment: name,
           namespace: ns,
@@ -557,6 +630,8 @@ class DiagnosticsEngine {
           request: params.request,
           limit: params.limit,
         };
+        await this._applyGitopsEdit(result, action);
+        return result;
       }
 
       case "expand_pvc": {
@@ -615,7 +690,7 @@ class DiagnosticsEngine {
           undefined,
           { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
         );
-        return {
+        const result = {
           action: "pvc_expanded",
           pvc: name,
           namespace: ns,
@@ -623,6 +698,8 @@ class DiagnosticsEngine {
           newSize,
           note: "Filesystem resize completes automatically; some provisioners require a pod restart to finish the resize.",
         };
+        await this._applyGitopsEdit(result, action);
+        return result;
       }
 
       case "rollback_deployment": {
@@ -654,7 +731,18 @@ class DiagnosticsEngine {
             { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
           );
           const previousRev = previousRS.metadata.annotations?.['deployment.kubernetes.io/revision'] || 'unknown';
-          return { action: "deployment_rolled_back", deployment: name, namespace: ns, revision: previousRev };
+          const result = { action: "deployment_rolled_back", deployment: name, namespace: ns, revision: previousRev };
+
+          // The repo edit needs the concrete previous-revision image, which is
+          // only known here (from live ReplicaSet history). If the previous
+          // template has more than one container we can't tell which one the
+          // caller meant to roll back — never guess; skip the repo edit (the
+          // live rollback above already happened) with a clear note.
+          const previousContainers = previousRS.spec?.template?.spec?.containers || [];
+          const resolvedImage = previousContainers.length === 1 ? previousContainers[0].image : null;
+          await this._applyGitopsEdit(result, action, { resolvedImage });
+
+          return result;
         } catch (rollbackErr) {
           return { success: false, message: `Rollback failed: ${rollbackErr.message}` };
         }
@@ -727,6 +815,22 @@ class DiagnosticsEngine {
 
       default:
         throw new Error(`Unknown action type: ${action.action_type}`);
+    }
+  }
+
+  // --- Best-effort GitOps repo edit (spec-changing actions only) ---
+  //
+  // Called at the end of each ELIGIBLE case in executeAction, after the live
+  // patch has already succeeded. A git failure here NEVER affects the
+  // already-applied live fix — it is only ever recorded on result.gitops so
+  // it can be surfaced in execution_result. The PAT is never allowed to
+  // leave gitops.js unredacted.
+  async _applyGitopsEdit(result, action, opts = {}) {
+    if (!this.config?.gitops) return;
+    try {
+      result.gitops = await gitops.applyEdit(this.config.gitops, action, opts);
+    } catch (err) {
+      result.gitops = { error: gitops.redact(err.message, this.config.gitops.pat) };
     }
   }
 
