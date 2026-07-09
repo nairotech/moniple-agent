@@ -222,7 +222,7 @@ class DiagnosticsEngine {
       // 2. Call LLM for analysis
       const llmClient = new LLMClient(this.config.llm);
       const locale = this.config.llm.locale || "en";
-      const minSeverity = this.config.schedule?.min_severity || "info";
+      const minSeverity = this.config.schedule?.min_severity || "warning";
       const systemPrompt = getSystemPrompt(locale);
       const userPrompt = getUserPrompt(diagnosticData, minSeverity);
 
