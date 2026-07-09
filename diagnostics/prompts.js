@@ -96,6 +96,10 @@ function getLanguageName(locale) {
     it: "Italian",
     ru: "Russian",
     ar: "Arabic",
+    hi: "Hindi",
+    id: "Indonesian",
+    pl: "Polish",
+    vi: "Vietnamese",
   };
   return names[locale] || "English";
 }
