@@ -219,12 +219,39 @@ class DiagnosticsEngine {
       }
       const diagnosticData = await this.collector.collect(checks);
 
+      // 1.5 Analysis context (both best-effort — a scan never fails because
+      // the repo or the server was unreachable).
+      //
+      // GitOps desired-state digest: lets the LLM base proposed values on the
+      // manifests it would be committing to, and report live-vs-git drift.
+      if (this.config?.gitops && this.config.gitops.enabled !== false) {
+        try {
+          const digest = await gitops.collectManifestDigest(this.config.gitops);
+          if (digest?.workloads?.length) {
+            diagnosticData.gitops_managed = true;
+            diagnosticData.gitops_desired_state = digest;
+          }
+        } catch (err) {
+          console.error(
+            "[Doctor] GitOps digest failed:",
+            gitops.redact(err.message, this.config.gitops.pat)
+          );
+        }
+      }
+
+      // Last-5-scan history: powers the rejected-action suppression and the
+      // recurring-approved-action root-cause rules in the system prompt.
+      const scanHistory = await this.fetchScanHistory();
+
       // 2. Call LLM for analysis
       const llmClient = new LLMClient(this.config.llm);
       const locale = this.config.llm.locale || "en";
       const minSeverity = this.config.schedule?.min_severity || "warning";
-      const systemPrompt = getSystemPrompt(locale);
-      const userPrompt = getUserPrompt(diagnosticData, minSeverity);
+      const systemPrompt = getSystemPrompt(locale, {
+        hasGitops: !!diagnosticData.gitops_desired_state,
+        hasHistory: !!scanHistory,
+      });
+      const userPrompt = getUserPrompt(diagnosticData, minSeverity, scanHistory);
 
       let analysis = null;
       let tokensUsed = null;
@@ -320,6 +347,33 @@ class DiagnosticsEngine {
       console.error("[Doctor] Diagnostic cycle error:", err.message);
     } finally {
       this.running = false;
+    }
+  }
+
+  // --- Previous-scan history (context for the LLM) ---
+
+  /**
+   * Fetch the cluster's last completed scans (findings + action outcomes)
+   * from the server. Returns null on ANY failure or when there is no history
+   * — the prompt then simply omits the SCAN HISTORY section. Older servers
+   * without the endpoint 404 into the same null path.
+   */
+  async fetchScanHistory() {
+    if (!this.serverUrl || !this.apiKey) return null;
+    try {
+      const response = await fetch(
+        `${this.serverUrl}/api/v1/agent/doctor/history?limit=5`,
+        {
+          headers: { Authorization: `Bearer ${this.apiKey}` },
+        }
+      );
+      if (!response.ok) return null;
+      const data = await response.json();
+      const scans = data?.data?.scans;
+      return Array.isArray(scans) && scans.length ? scans : null;
+    } catch (err) {
+      console.error("[Doctor] Scan history fetch failed:", err.message);
+      return null;
     }
   }
 

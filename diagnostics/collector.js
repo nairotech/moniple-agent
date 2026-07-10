@@ -4,6 +4,31 @@
  * Each check returns a structured object with findings for the LLM to analyze.
  */
 
+const SYSTEM_NAMESPACES = ["kube-system", "kube-public", "kube-node-lease", "moniple"];
+
+// Current requests/limits of one named container in a pod spec. Returns null
+// when the container isn't found so the LLM's "values absent → don't propose
+// adjust_resources" rule kicks in instead of seeing an empty object.
+function currentContainerResources(podSpec, containerName) {
+  const all = [...(podSpec?.containers || []), ...(podSpec?.initContainers || [])];
+  const c = all.find((x) => x.name === containerName);
+  if (!c) return null;
+  return {
+    container: c.name,
+    requests: c.resources?.requests || null,
+    limits: c.resources?.limits || null,
+  };
+}
+
+// Current requests/limits of every (non-init) container in a pod spec.
+function currentPodResources(podSpec) {
+  return (podSpec?.containers || []).map((c) => ({
+    container: c.name,
+    requests: c.resources?.requests || null,
+    limits: c.resources?.limits || null,
+  }));
+}
+
 class DiagnosticCollector {
   constructor({ k8sCoreApi, k8sAppsApi, k8sBatchApi, k8sStorageApi, queryPrometheus }) {
     this.k8sCoreApi = k8sCoreApi;
@@ -55,6 +80,11 @@ class DiagnosticCollector {
       const phase = pod.status?.phase;
       const ns = pod.metadata?.namespace;
       const name = pod.metadata?.name;
+      // Current requests/limits of a named container — attached to every
+      // pod-level issue so the LLM can only ever propose adjust_resources
+      // values derived from what is actually configured today.
+      const resourcesOf = (containerName) =>
+        currentContainerResources(pod.spec, containerName);
 
       if (phase === "Running") summary.running++;
       else if (phase === "Pending") summary.pending++;
@@ -81,6 +111,7 @@ class DiagnosticCollector {
             container: cs.name,
             restartCount,
             message: cs.state?.waiting?.message || "",
+            current_resources: resourcesOf(cs.name),
           });
         }
 
@@ -106,6 +137,7 @@ class DiagnosticCollector {
             namespace: ns,
             container: cs.name,
             restartCount,
+            current_resources: resourcesOf(cs.name),
           });
         }
       }
@@ -126,6 +158,9 @@ class DiagnosticCollector {
             namespace: ns,
             ageMinutes: Math.round(ageMinutes),
             conditions,
+            // All containers' requests — Pending is often unschedulable
+            // because the requests don't fit any node.
+            current_resources: currentPodResources(pod.spec),
           });
         }
       }
@@ -484,6 +519,11 @@ class DiagnosticCollector {
     const issues = [];
     const summary = { total: deployments.length, healthy: 0, degraded: 0 };
 
+    // Current per-container requests/limits for every deployment — the source
+    // the LLM must derive adjust_resources values from (degraded workloads
+    // first so they survive the cap on large clusters).
+    const workloadResources = [];
+
     for (const dep of deployments) {
       const name = dep.metadata?.name;
       const ns = dep.metadata?.namespace;
@@ -491,8 +531,20 @@ class DiagnosticCollector {
       const available = dep.status?.availableReplicas ?? 0;
       const ready = dep.status?.readyReplicas ?? 0;
       const unavailable = dep.status?.unavailableReplicas ?? 0;
+      const degraded = !(available >= desired && ready >= desired);
+      const containers = currentPodResources(dep.spec?.template?.spec);
 
-      if (available >= desired && ready >= desired) {
+      if (!SYSTEM_NAMESPACES.includes(ns)) {
+        workloadResources.push({
+          deployment: name,
+          namespace: ns,
+          replicas: desired,
+          degraded,
+          containers,
+        });
+      }
+
+      if (!degraded) {
         summary.healthy++;
       } else {
         summary.degraded++;
@@ -505,6 +557,7 @@ class DiagnosticCollector {
           available,
           ready,
           unavailable,
+          current_resources: containers,
         });
       }
 
@@ -522,7 +575,13 @@ class DiagnosticCollector {
       }
     }
 
-    return { summary, issues };
+    workloadResources.sort((a, b) => (b.degraded ? 1 : 0) - (a.degraded ? 1 : 0));
+
+    return {
+      summary,
+      issues,
+      workload_resources: workloadResources.slice(0, 100),
+    };
   }
 
   // --- Log Analysis (CrashLoopBackOff pods only) ---
@@ -546,6 +605,7 @@ class DiagnosticCollector {
             namespace: pod.metadata?.namespace,
             container: cs.name,
             reason: cs.state?.waiting?.reason || cs.lastState?.terminated?.reason,
+            current_resources: currentContainerResources(pod.spec, cs.name),
           });
         }
       }
@@ -607,4 +667,4 @@ class DiagnosticCollector {
   }
 }
 
-module.exports = { DiagnosticCollector };
+module.exports = { DiagnosticCollector, currentContainerResources, currentPodResources };

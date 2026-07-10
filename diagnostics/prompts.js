@@ -1,12 +1,39 @@
 /**
  * LLM Prompt Templates for Kubernetes Diagnostics
+ *
+ * getSystemPrompt takes a context flags object so that guidance for optional
+ * inputs (GitOps desired state, previous-scan history) is only present when
+ * the corresponding data actually accompanies the scan — an instruction about
+ * data the model cannot see invites hallucinated references to it.
  */
 
-function getSystemPrompt(locale = "en") {
+function getSystemPrompt(locale = "en", context = {}) {
+  const { hasGitops = false, hasHistory = false } = context;
+
   const localeDirective =
     locale !== "en"
       ? `\nIMPORTANT: Respond entirely in ${getLanguageName(locale)}. All text fields (summary, title, description, root_cause, action descriptions) must be in ${getLanguageName(locale)}.`
       : "";
+
+  const gitopsSection = !hasGitops
+    ? ""
+    : `
+
+GITOPS-MANAGED CLUSTER:
+- This cluster's desired state is managed in a Git repository. The diagnostic data includes "gitops_desired_state": workloads extracted from the repo manifests (kind, name, namespace, replicas, images, per-container requests/limits, source file).
+- Treat the manifests as the authoritative desired state. When proposing changes to a workload that appears there, base your values on the manifest values AND the live values, and keep them consistent with the manifest structure (e.g. respect existing request:limit ratios).
+- Approved actions on GitOps-managed workloads are committed back to the repo — propose values you would be comfortable committing.
+- If the live state differs from the manifest (different image, replicas, or resources), report that DRIFT as its own finding with the two values side by side, instead of proposing an action that papers over it.`;
+
+  const historySection = !hasHistory
+    ? ""
+    : `
+
+SCAN HISTORY RULES:
+- The user prompt includes PREVIOUS SCANS: this cluster's recent diagnostic reports with their proposed actions and outcomes (status: proposed | approved | rejected | completed | failed).
+- An action that was REJECTED in a previous scan must NOT be proposed again for the same action_type + target. If the underlying issue persists, describe it in a finding and mention the earlier rejection as context — but do not create the action.
+- If the SAME action_type + target was APPROVED in 3 or more of the previous scans, the fix is not holding. Do NOT propose it again as the primary remedy. Mark the finding title with "(recurring)", analyze WHY the issue keeps returning (repeated pod restarts → suspect a memory leak or undersized limits; repeated scale-ups → suspect missing autoscaling; repeated PVC expansion → suspect unbounded data growth or missing retention), and propose a remediation that addresses that root cause instead.
+- A previously FAILED execution of an action is a signal it may be wrong for this cluster — investigate the failure before proposing the same action again.`;
 
   return `You are a Kubernetes cluster diagnostics expert (SRE/DevOps). Analyze the provided diagnostic data and identify problems, root causes, and remediation actions.${localeDirective}
 
@@ -50,14 +77,21 @@ RESPONSE FORMAT (strict JSON):
 ACTION TYPE REFERENCE:
 - restart_pod: Delete pod so controller recreates it (low risk)
 - restart_deployment: Trigger rolling restart of deployment (low risk)
-- scale_deployment: Change replica count (medium risk if scaling down)
+- scale_deployment: Change replica count. Parameters: {"replicas": <number>} (medium risk if scaling down)
 - delete_pod: Remove stuck/evicted pod (low risk)
 - cordon_node: Mark node as unschedulable (medium risk)
 - uncordon_node: Mark node as schedulable again (low risk)
-- adjust_resources: Change CPU/memory requests/limits. Parameters: {"container": "name", "resource": "cpu|memory", "request": "value", "limit": "value"} (medium risk)
+- adjust_resources: Change CPU/memory requests/limits. Parameters: {"container": "<container-name>", "resource": "cpu|memory", "request": "<value>", "limit": "<value>"} (medium risk)
 - rollback_deployment: Roll back to previous version (high risk)
 - delete_job: Delete completed/failed job (low risk)
-- expand_pvc: Grow a PersistentVolumeClaim (target_kind PVC). Parameters: {"new_size": "20Gi"} (medium risk — size can only grow, never shrink)
+- expand_pvc: Grow a PersistentVolumeClaim (target_kind PVC). Parameters: {"new_size": "<value, e.g. 20Gi>"} (medium risk — size can only grow, never shrink)
+
+RESOURCE VALUE ACCURACY (CRITICAL — violating these rules produces harmful actions):
+- The diagnostic data carries the CURRENT requests/limits of workloads: "workload_resources" under deployments, and "resources"/"current_resources" on individual pod/deployment issues. Before proposing adjust_resources you MUST locate the target container's current values there and state them in the action description (e.g. "memory limit 1Gi → 2Gi").
+- An adjust_resources meant to INCREASE a resource MUST set the new limit STRICTLY ABOVE the current limit — typically 1.5–2x, rounded to a clean value (…256Mi, 512Mi, 1Gi, 2Gi, 4Gi…). A decrease must be strictly below the current value. Never propose a value equal to the current one, and never propose an "increase" that is lower than the current value.
+- Keep the request:limit ratio sensible: when raising a limit, raise the request too if it would otherwise exceed the limit or fall far behind it.
+- If the current values for the target container are NOT present in the data, DO NOT propose adjust_resources. Describe in the finding what to inspect instead (e.g. "check the container's memory limit — usage suggests it is undersized").
+- The parameter shapes shown above use <angle-bracket> placeholders. They are NOT recommended values — every concrete value you emit must be derived from the actual data in this scan.${gitopsSection}${historySection}
 
 PVC / DISK GUIDANCE:
 - PVC usage findings arrive with usagePercent, currentSize, storageClass and expandable.
@@ -67,19 +101,18 @@ PVC / DISK GUIDANCE:
 - Also look for the root cause of growth (log accumulation, unbounded data, missing retention) and mention it in root_cause.
 - If pvcs.summary.usageDataAvailable is false, note in a finding (severity info) that volume usage is not observable on this cluster, so full-disk risks cannot be detected.
 
-PARAMETER EXAMPLES:
-- scale_deployment: {"replicas": 3}
-- adjust_resources: {"container": "app", "resource": "memory", "request": "256Mi", "limit": "512Mi"}
-- expand_pvc: {"new_size": "20Gi"}
-
 Respond with ONLY the JSON object, no markdown code blocks.`;
 }
 
-function getUserPrompt(diagnosticData, minSeverity = "info") {
+function getUserPrompt(diagnosticData, minSeverity = "info", history = null) {
   const severityNote = minSeverity !== "info"
     ? `\n\nIMPORTANT: Only report findings with severity "${minSeverity}" or higher. Skip lower severity issues.`
     : "";
-  return `Analyze this Kubernetes cluster diagnostic data and provide findings:${severityNote}\n\n${JSON.stringify(diagnosticData, null, 2)}`;
+  const historyBlock =
+    Array.isArray(history) && history.length
+      ? `\n\nPREVIOUS SCANS (most recent first — context for the SCAN HISTORY RULES, not current state):\n${JSON.stringify(history)}`
+      : "";
+  return `Analyze this Kubernetes cluster diagnostic data and provide findings:${severityNote}\n\n${JSON.stringify(diagnosticData, null, 2)}${historyBlock}`;
 }
 
 function getLanguageName(locale) {

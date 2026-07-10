@@ -780,6 +780,75 @@ async function withRepo(cfg, fn) {
 }
 
 // ---------------------------------------------------------------------------
+// Desired-state digest (scan time — read only, feeds the LLM's analysis)
+// ---------------------------------------------------------------------------
+
+const DIGEST_WORKLOAD_KINDS = new Set(["Deployment", "StatefulSet", "DaemonSet", "CronJob"]);
+const DIGEST_MAX_WORKLOADS = 150;
+
+/**
+ * Extract a compact workload digest from the jailed gitops folder so the LLM
+ * sees the DESIRED state (replicas, images, per-container requests/limits)
+ * before proposing actions. Pure extraction of already-jailed files — reuses
+ * withRepo's sparse checkout and walkYamlFiles' symlink jail; nothing here
+ * ever leaves the folder or touches the PAT beyond the clone itself.
+ */
+function extractWorkloadDigest(repoRoot, folder) {
+  const files = walkYamlFiles(repoRoot, folder);
+  const workloads = [];
+
+  for (const abs of files) {
+    if (workloads.length >= DIGEST_MAX_WORKLOADS) break;
+    let text;
+    try {
+      text = fs.readFileSync(abs, "utf8");
+    } catch {
+      continue;
+    }
+    let docs;
+    try {
+      docs = YAML.parseAllDocuments(text).map((d) => d.toJS());
+    } catch {
+      continue; // unparseable YAML — skip the file, never the digest
+    }
+    for (const doc of docs) {
+      if (workloads.length >= DIGEST_MAX_WORKLOADS) break;
+      if (!doc || typeof doc !== "object" || !DIGEST_WORKLOAD_KINDS.has(doc.kind)) continue;
+      const podSpec =
+        doc.kind === "CronJob"
+          ? doc.spec?.jobTemplate?.spec?.template?.spec
+          : doc.spec?.template?.spec;
+      workloads.push({
+        kind: doc.kind,
+        name: doc.metadata?.name || null,
+        namespace: doc.metadata?.namespace || null,
+        replicas: doc.spec?.replicas ?? null,
+        file: path.relative(repoRoot, abs),
+        containers: (podSpec?.containers || []).map((c) => ({
+          container: c.name,
+          image: c.image || null,
+          requests: c.resources?.requests || null,
+          limits: c.resources?.limits || null,
+        })),
+      });
+    }
+  }
+
+  return { workload_count: workloads.length, workloads };
+}
+
+/**
+ * Clone (shallow+sparse, same jail as previews) and build the desired-state
+ * digest. Callers treat any throw as "no digest" — a scan must never fail
+ * because the repo was unreachable.
+ */
+async function collectManifestDigest(cfg) {
+  return withRepo(cfg, async (repoRoot) =>
+    extractWorkloadDigest(repoRoot, cfg.folder),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Preview (scan time — read only, never writes)
 // ---------------------------------------------------------------------------
 
@@ -1077,6 +1146,8 @@ module.exports = {
   gitAuthHeaderValue,
   gitAuthArgs,
   withRepo,
+  extractWorkloadDigest,
+  collectManifestDigest,
   computePreviews,
   checkStatus,
   applyEdit,
