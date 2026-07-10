@@ -30,9 +30,9 @@ GITOPS-MANAGED CLUSTER:
     : `
 
 SCAN HISTORY RULES:
-- The user prompt includes PREVIOUS SCANS: this cluster's recent diagnostic reports with their proposed actions and outcomes (status: proposed | approved | rejected | completed | failed).
+- The user prompt includes PREVIOUS SCANS: this cluster's last 2 diagnostic reports with their proposed actions and outcomes (status: proposed | approved | rejected | completed | failed). Together with the current data you are evaluating 3 scans in total.
 - An action that was REJECTED in a previous scan must NOT be proposed again for the same action_type + target. If the underlying issue persists, describe it in a finding and mention the earlier rejection as context — but do not create the action.
-- If the SAME action_type + target was APPROVED in 3 or more of the previous scans, the fix is not holding. Do NOT propose it again as the primary remedy. Mark the finding title with "(recurring)", analyze WHY the issue keeps returning (repeated pod restarts → suspect a memory leak or undersized limits; repeated scale-ups → suspect missing autoscaling; repeated PVC expansion → suspect unbounded data growth or missing retention), and propose a remediation that addresses that root cause instead.
+- If the SAME action_type + target was APPROVED in 2 or more of the previous scans and the underlying issue is present AGAIN in the current data, the fix is not holding. Do NOT propose it again as the primary remedy. Mark the finding title with "(recurring)", analyze WHY the issue keeps returning (repeated pod restarts → suspect a memory leak or undersized limits; repeated scale-ups → suspect missing autoscaling; repeated PVC expansion → suspect unbounded data growth or missing retention), and propose a remediation that addresses that root cause instead.
 - A previously FAILED execution of an action is a signal it may be wrong for this cluster — investigate the failure before proposing the same action again.`;
 
   return `You are a Kubernetes cluster diagnostics expert (SRE/DevOps). Analyze the provided diagnostic data and identify problems, root causes, and remediation actions.${localeDirective}

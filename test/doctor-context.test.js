@@ -55,7 +55,8 @@ test("history section only present with hasHistory, carries reject + recurrence 
   const p = getSystemPrompt("en", { hasHistory: true });
   assert.match(p, /SCAN HISTORY RULES/);
   assert.match(p, /REJECTED in a previous scan must NOT be proposed again/);
-  assert.match(p, /APPROVED in 3 or more/);
+  assert.match(p, /APPROVED in 2 or more/);
+  assert.match(p, /last 2 diagnostic reports/);
   assert.match(p, /\(recurring\)/);
 });
 
@@ -217,7 +218,7 @@ test("fetchScanHistory returns null on non-ok / empty and scans on success", asy
 
   const scans = [{ id: "r1", actions: [{ action_type: "restart_pod", status: "rejected" }] }];
   global.fetch = async (url) => {
-    assert.match(String(url), /\/api\/v1\/agent\/doctor\/history\?limit=5$/);
+    assert.match(String(url), /\/api\/v1\/agent\/doctor\/history\?limit=2$/);
     return { ok: true, json: async () => ({ data: { scans } }) };
   };
   assert.deepStrictEqual(await engine.fetchScanHistory(), scans);

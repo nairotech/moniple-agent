@@ -239,8 +239,10 @@ class DiagnosticsEngine {
         }
       }
 
-      // Last-5-scan history: powers the rejected-action suppression and the
-      // recurring-approved-action root-cause rules in the system prompt.
+      // Last-2-scan history (this scan makes 3 evaluated in total — kept
+      // small deliberately: each report carries findings + actions and the
+      // tokens land on the user's LLM bill): powers the rejected-action
+      // suppression and the recurring-approved-action root-cause rules.
       const scanHistory = await this.fetchScanHistory();
 
       // 2. Call LLM for analysis
@@ -353,7 +355,7 @@ class DiagnosticsEngine {
   // --- Previous-scan history (context for the LLM) ---
 
   /**
-   * Fetch the cluster's last completed scans (findings + action outcomes)
+   * Fetch the cluster's last 2 completed scans (findings + action outcomes)
    * from the server. Returns null on ANY failure or when there is no history
    * — the prompt then simply omits the SCAN HISTORY section. Older servers
    * without the endpoint 404 into the same null path.
@@ -362,7 +364,7 @@ class DiagnosticsEngine {
     if (!this.serverUrl || !this.apiKey) return null;
     try {
       const response = await fetch(
-        `${this.serverUrl}/api/v1/agent/doctor/history?limit=5`,
+        `${this.serverUrl}/api/v1/agent/doctor/history?limit=2`,
         {
           headers: { Authorization: `Bearer ${this.apiKey}` },
         }
