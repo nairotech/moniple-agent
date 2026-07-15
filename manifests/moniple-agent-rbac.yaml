@@ -62,7 +62,14 @@ rules:
       - resourcequotas
       - replicationcontrollers
       - limitranges
+      # Doctor reads cluster events (core API) to explain pod failures /
+      # scheduling issues. Without this the events check 403s.
+      - events
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # events also live under events.k8s.io on modern clusters — read there too.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
   # Apps resources
   - apiGroups: ["apps"]
     resources:
