@@ -9,6 +9,9 @@ metadata:
   namespace: moniple
   labels:
     app: moniple-vmsingle
+    # Standard VictoriaMetrics label so conventional selectors/scrape-configs
+    # (app.kubernetes.io/name=victoria-metrics-single) match this instance.
+    app.kubernetes.io/name: victoria-metrics-single
     managed-by: moniple-agent
 spec:
   replicas: 1
@@ -19,6 +22,7 @@ spec:
     metadata:
       labels:
         app: moniple-vmsingle
+        app.kubernetes.io/name: victoria-metrics-single
     spec:
       containers:
         - name: vmsingle
@@ -64,6 +68,7 @@ metadata:
   namespace: moniple
   labels:
     app: moniple-vmsingle
+    app.kubernetes.io/name: victoria-metrics-single
     managed-by: moniple-agent
 spec:
   type: ClusterIP
