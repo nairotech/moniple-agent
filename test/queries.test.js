@@ -18,13 +18,18 @@ const REQUIRED_KEYS = [
   "NODE_INFO",
   "NODE_INFO_EXPORTER",
   "NODE_INFO_KSM",
+  // Primary (kubelet/cAdvisor) sources — these define what the dashboard shows
+  "NODE_MEMORY_WORKING_SET",
+  "NODE_CPU_CORES_USED",
+  "NODE_FS_SIZE",
+  "NODE_FS_AVAIL",
+  // Fallbacks (node-exporter / cAdvisor rootfs) — used when the primary is absent
   "NODE_MEMORY_USAGE",
-  "NODE_MEMORY_TOTAL",
-  "NODE_DISK_USAGE",
-  "NODE_DISK_USAGE_CADVISOR",
-  "NODE_DISK_TOTAL",
-  "NODE_DISK_TOTAL_CADVISOR",
   "NODE_CPU_USAGE",
+  "NODE_DISK_USAGE_CADVISOR",
+  "NODE_DISK_TOTAL_CADVISOR",
+  // Capacities (kube-state-metrics)
+  "NODE_MEMORY_TOTAL",
   "NODE_CPU_TOTAL",
   "NODE_POD_USAGE",
   "NODE_POD_TOTAL",
