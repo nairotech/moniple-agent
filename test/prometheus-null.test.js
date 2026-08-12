@@ -11,7 +11,8 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 
-const { queryPrometheus, fetchAlerts } = require("../lib/prometheus");
+const prometheus = require("../lib/prometheus");
+const { queryPrometheus } = prometheus;
 
 function withFetch(impl, fn) {
   const original = global.fetch;
@@ -76,15 +77,11 @@ test("a timeout (abort) returns null", async () => {
   );
 });
 
-test("fetchAlerts keeps its legacy []-on-failure contract", async () => {
-  await withFetch(
-    async () => {
-      throw new Error("ECONNREFUSED");
-    },
-    async () => {
-      // An alerting backend is optional; a cluster without vmalert genuinely
-      // has zero alerts, and the alerts snapshot has its own ingest semantics.
-      assert.deepStrictEqual(await fetchAlerts(), []);
-    },
-  );
+test("the alert-fetching surface is fully removed (2026-08-12 retirement)", () => {
+  // fetchAlerts() used to hit `${apiUrl}/alerts` with a legacy []-on-failure
+  // contract; no live cluster runs vmalert, so it always returned []. Removed
+  // along with the rest of the alert-ingest pipeline (collectors.getAlertsData,
+  // the agent's GET /metrics/alerts route, and the pushed `alerts` snapshot).
+  assert.strictEqual(prometheus.fetchAlerts, undefined);
+  assert.deepStrictEqual(Object.keys(prometheus).sort(), ["queryPrometheus"]);
 });

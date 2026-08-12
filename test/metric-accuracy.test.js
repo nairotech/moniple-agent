@@ -30,14 +30,12 @@ const QUERIES = require("../lib/queries");
 const promPath = require.resolve("../lib/prometheus");
 // query string -> result (Array = success, null = query failure)
 let RESULTS = new Map();
-let ALERTS = [];
 require.cache[promPath] = {
   id: promPath,
   filename: promPath,
   loaded: true,
   exports: {
     queryPrometheus: async (q) => (RESULTS.has(q) ? RESULTS.get(q) : []),
-    fetchAlerts: async () => ALERTS,
   },
 };
 
@@ -45,9 +43,8 @@ const collectors = require("../lib/collectors");
 
 const series = (metric, value) => ({ metric, value: [1786531423, String(value)] });
 
-function setup(map, alerts = []) {
+function setup(map) {
   RESULTS = new Map(Object.entries(map));
-  ALERTS = alerts;
 }
 
 // A cluster of KSM-listed nodes with kubelet (cAdvisor) CPU/memory, one
@@ -447,14 +444,21 @@ test("legacy snapshot fields are preserved (names unchanged, only semantics)", a
   assert.ok("total" in overview.alerts && "firing" in overview.alerts && "critical" in overview.alerts);
 });
 
-test("alerts still drive healthy and the critical counters", async () => {
-  setup(clusterFixture([{ name: "n1", workingSet: 10, memAllocatable: 100 }]), [
-    { state: "firing", labels: { severity: "critical" } },
-    { state: "firing", labels: { severity: "warning" } },
-  ]);
+// ---------------------------------------------------------------------------
+// 9. Alert ingest retirement (2026-08-12): no live cluster runs vmalert (24/24
+// measured), so the pipeline was removed. overview.alerts stays a FIXED
+// {0,0,0} placeholder for backward compatibility (older app builds still read
+// it) instead of being deleted outright.
+// ---------------------------------------------------------------------------
+test("overview.alerts is a fixed zero placeholder, no longer derived from a query", async () => {
+  setup(clusterFixture([{ name: "n1", workingSet: 95, memAllocatable: 100 }]));
   const overview = await collectors.getOverviewData();
-  assert.strictEqual(overview.alerts.total, 2);
-  assert.strictEqual(overview.alerts.firing, 2);
-  assert.strictEqual(overview.alerts.critical, 1);
-  assert.strictEqual(overview.healthy, false, "a critical alert must veto healthy");
+  assert.deepStrictEqual(overview.alerts, { total: 0, firing: 0, critical: 0 });
+  // A hot node alone (no alerts involved at all any more) is enough to flip
+  // healthy false — alerts cannot veto it because there is no alerts leg left.
+  assert.strictEqual(overview.healthy, false);
+});
+
+test("the alert collection surface is fully removed from collectors", () => {
+  assert.strictEqual(collectors.getAlertsData, undefined);
 });
