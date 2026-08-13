@@ -3,8 +3,12 @@
  * (docs/superpowers/specs/2026-07-10-doctor-context-aware-recommendations-design.md):
  *  - prompts: conditional GITOPS / SCAN HISTORY sections + resource-accuracy rules
  *  - collector helpers: current requests/limits extraction
- *  - gitops: desired-state digest extraction from manifest YAMLs
- *  - engine: fetchScanHistory never throws, null on failure paths
+ *  - engine: fetchScanHistory / fetchDesiredState never throw, null on failure
+ *
+ * NOTE (2026-08-13): the desired-state digest is no longer extracted here —
+ * the agent holds no repository credential and does no git. The server
+ * extracts it (moniple-server src/modules/doctor/gitops.repo.ts,
+ * test/gitops-repo.test.js) and the agent fetches the result.
  */
 
 const { test, after } = require("node:test");
@@ -18,7 +22,6 @@ const {
   currentContainerResources,
   currentPodResources,
 } = require("../diagnostics/collector");
-const { extractWorkloadDigest } = require("../diagnostics/gitops");
 const { DiagnosticsEngine } = require("../diagnostics/index");
 
 const tmpDirs = [];
@@ -110,80 +113,7 @@ test("currentPodResources lists non-init containers", () => {
   assert.deepStrictEqual(currentPodResources(undefined), []);
 });
 
-// --- gitops digest -------------------------------------------------------------
-
-const DIGEST_DEPLOYMENT = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api
-  namespace: prod
-spec:
-  replicas: 3
-  template:
-    spec:
-      containers:
-        - name: api
-          image: repo/api:v2
-          resources:
-            requests: { memory: 512Mi }
-            limits: { memory: 1Gi }
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: api
-`;
-
-const DIGEST_CRONJOB = `apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: nightly
-  namespace: prod
-spec:
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          containers:
-            - name: job
-              image: repo/job:v1
-`;
-
-test("extractWorkloadDigest extracts workloads, skips non-workloads and broken yaml", () => {
-  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "digest-"));
-  tmpDirs.push(repoRoot);
-  const folder = "apps";
-  fs.mkdirSync(path.join(repoRoot, folder, "nested"), { recursive: true });
-  fs.writeFileSync(path.join(repoRoot, folder, "api.yaml"), DIGEST_DEPLOYMENT);
-  fs.writeFileSync(path.join(repoRoot, folder, "nested", "cron.yml"), DIGEST_CRONJOB);
-  fs.writeFileSync(path.join(repoRoot, folder, "broken.yaml"), "{ not: [valid");
-  fs.writeFileSync(path.join(repoRoot, folder, "notes.txt"), "kind: Deployment");
-
-  const digest = extractWorkloadDigest(repoRoot, folder);
-  assert.strictEqual(digest.workload_count, 2);
-
-  const dep = digest.workloads.find((w) => w.kind === "Deployment");
-  assert.strictEqual(dep.name, "api");
-  assert.strictEqual(dep.namespace, "prod");
-  assert.strictEqual(dep.replicas, 3);
-  assert.strictEqual(dep.file, path.join("apps", "api.yaml"));
-  assert.deepStrictEqual(dep.containers, [
-    {
-      container: "api",
-      image: "repo/api:v2",
-      requests: { memory: "512Mi" },
-      limits: { memory: "1Gi" },
-    },
-  ]);
-
-  // CronJob pod spec lives under jobTemplate
-  const cron = digest.workloads.find((w) => w.kind === "CronJob");
-  assert.strictEqual(cron.containers[0].image, "repo/job:v1");
-  // Service and the txt/broken files contribute nothing
-  assert.ok(digest.workloads.every((w) => w.kind !== "Service"));
-});
-
-// --- engine.fetchScanHistory -----------------------------------------------------
+// --- engine.fetchScanHistory / fetchDesiredState ---------------------------------
 
 function makeEngine() {
   // Constructor shape mirrors app.js wiring; only serverUrl/apiKey matter here.
@@ -222,4 +152,51 @@ test("fetchScanHistory returns null on non-ok / empty and scans on success", asy
     return { ok: true, json: async () => ({ data: { scans } }) };
   };
   assert.deepStrictEqual(await engine.fetchScanHistory(), scans);
+});
+
+test("fetchDesiredState asks the SERVER for the digest (agent never clones)", async (t) => {
+  const engine = makeEngine();
+  const realFetch = global.fetch;
+  t.after(() => {
+    global.fetch = realFetch;
+  });
+
+  const digest = {
+    workload_count: 1,
+    workloads: [{ kind: "Deployment", name: "api", replicas: 3 }],
+  };
+  let seenUrl = null;
+  global.fetch = async (url) => {
+    seenUrl = String(url);
+    return { ok: true, json: async () => ({ ok: true, data: { digest } }) };
+  };
+
+  assert.deepStrictEqual(await engine.fetchDesiredState(), digest);
+  assert.match(seenUrl, /\/api\/v1\/agent\/doctor\/gitops\/desired-state$/);
+});
+
+test("fetchDesiredState degrades to null (old server 404, empty digest, network error)", async (t) => {
+  const engine = makeEngine();
+  const realFetch = global.fetch;
+  t.after(() => {
+    global.fetch = realFetch;
+  });
+
+  // Older server without the endpoint.
+  global.fetch = async () => ({ ok: false, status: 404 });
+  assert.strictEqual(await engine.fetchDesiredState(), null);
+
+  // Repo attached but nothing extractable / clone failed server-side.
+  global.fetch = async () => ({ ok: true, json: async () => ({ data: { digest: null } }) });
+  assert.strictEqual(await engine.fetchDesiredState(), null);
+
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({ data: { digest: { workload_count: 0, workloads: [] } } }),
+  });
+  assert.strictEqual(await engine.fetchDesiredState(), null);
+
+  // Network error must never escape (a scan can't fail over a digest).
+  global.fetch = realFetch;
+  assert.strictEqual(await engine.fetchDesiredState(), null); // port 9 → refused
 });

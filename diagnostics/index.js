@@ -3,11 +3,19 @@
  * Ties together: config fetch → collect → LLM analyze → push report → poll actions → execute
  */
 
-const crypto = require("crypto");
 const { DiagnosticCollector } = require("./collector");
 const { LLMClient } = require("./llm-client");
 const { getSystemPrompt, getUserPrompt } = require("./prompts");
-const gitops = require("./gitops");
+
+// NOTE (2026-08-13): this agent performs NO git operations and holds NO
+// repository credential. GitOps-aware remediation still works exactly as
+// before from the user's point of view — the agent applies the live patch and
+// the SERVER makes the matching repo commit (moniple-server
+// src/modules/doctor/gitops.service.ts). Previously the server shipped a
+// decrypted, write-capable GitHub PAT to every agent on each 60s config poll,
+// which meant anyone who could read the agent's API key out of the cluster
+// could pull the customer's infrastructure-repo credential out of the API.
+// Do NOT reintroduce a code path that asks the server for repo credentials.
 
 // ---------------------------------------------------------------------------
 // Remediation guardrails (security)
@@ -115,17 +123,10 @@ class DiagnosticsEngine {
       const result = await response.json();
       if (result.ok) {
         this.config = result.data;
-        // Best-effort: report GitOps connectivity whenever the gitops block
-        // changes (including the very first time it appears). Never allowed
-        // to fail — or BLOCK — a config fetch: this can take up to ~60s
-        // (ls-remote + a sparse clone) and fetchConfig is on the hot path of
-        // the 60s poll loop (startSchedule) and the pending-action poll, so
-        // it's fired-and-forgotten rather than awaited. The `.catch` here is
-        // a defensive backstop only — _maybeReportGitopsStatus already
-        // wraps its own git-touching work in try/catch internally.
-        void this._maybeReportGitopsStatus().catch((err) => {
-          console.error("[Doctor] GitOps status check crashed unexpectedly:", err && err.message);
-        });
+        // The gitops block here is metadata only ({configured, delivery_mode,
+        // managed_by:"server"}). There is nothing to act on: repo
+        // connectivity is measured server-side (the agent has no credential
+        // with which to measure it) and the commit is made server-side.
         return this.config;
       }
     } catch (err) {
@@ -134,52 +135,31 @@ class DiagnosticsEngine {
     return null;
   }
 
-  // --- GitOps status reporting (config-change-triggered) ---
+  // --- GitOps desired state (server-provided LLM context) ---
 
-  _gitopsHash(gitopsCfg) {
-    if (!gitopsCfg) return null;
-    return crypto.createHash("sha256").update(JSON.stringify(gitopsCfg)).digest("hex");
-  }
-
-  async _maybeReportGitopsStatus() {
-    const gitopsCfg = this.config?.gitops || null;
-    const sig = this._gitopsHash(gitopsCfg);
-
-    // Idempotency: only re-check when the gitops block actually changed
-    // (including its first appearance) — never on every 60s config refresh.
-    if (sig === this._gitopsSig) {
-      return;
-    }
-    this._gitopsSig = sig;
-
-    if (!gitopsCfg) {
-      return; // gitops removed/disabled — nothing to report
-    }
-
+  /**
+   * Ask the SERVER for the attached repo's desired-state workload digest.
+   * The server owns the credential and does the (jailed, cached) clone; the
+   * agent only receives the extracted digest. Returns null on ANY failure —
+   * including an older server without the endpoint (404) — so a scan never
+   * fails because a repo was unreachable.
+   */
+  async fetchDesiredState() {
+    if (!this.serverUrl || !this.apiKey) return null;
     try {
-      const status = await gitops.checkStatus(gitopsCfg);
-      await this._postGitopsStatus(status);
+      const response = await fetch(
+        `${this.serverUrl}/api/v1/agent/doctor/gitops/desired-state`,
+        { headers: { Authorization: `Bearer ${this.apiKey}` } }
+      );
+      if (!response.ok) return null;
+      const data = await response.json();
+      const digest = data?.data?.digest;
+      return digest && Array.isArray(digest.workloads) && digest.workloads.length
+        ? digest
+        : null;
     } catch (err) {
-      // Defensive: checkStatus() never throws by design, but redact anyway —
-      // nothing derived from a gitops config may be logged unredacted.
-      console.error("[Doctor] GitOps status check failed:", gitops.redact(err.message, gitopsCfg.pat));
-    }
-  }
-
-  async _postGitopsStatus(status) {
-    if (!this.serverUrl || !this.apiKey) return;
-
-    try {
-      await fetch(`${this.serverUrl}/api/v1/agent/doctor/gitops/status`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({ status: status.status, detail: status.detail }),
-      });
-    } catch (err) {
-      console.error("[Doctor] Failed to report GitOps status:", err.message);
+      console.error("[Doctor] Desired-state fetch failed:", err.message);
+      return null;
     }
   }
 
@@ -223,19 +203,14 @@ class DiagnosticsEngine {
       // the repo or the server was unreachable).
       //
       // GitOps desired-state digest: lets the LLM base proposed values on the
-      // manifests it would be committing to, and report live-vs-git drift.
-      if (this.config?.gitops && this.config.gitops.enabled !== false) {
-        try {
-          const digest = await gitops.collectManifestDigest(this.config.gitops);
-          if (digest?.workloads?.length) {
-            diagnosticData.gitops_managed = true;
-            diagnosticData.gitops_desired_state = digest;
-          }
-        } catch (err) {
-          console.error(
-            "[Doctor] GitOps digest failed:",
-            gitops.redact(err.message, this.config.gitops.pat)
-          );
+      // manifests that will be committed, and report live-vs-git drift. The
+      // digest comes FROM THE SERVER (which owns the repo credential); the
+      // agent never clones anything.
+      if (this.config?.gitops) {
+        const digest = await this.fetchDesiredState();
+        if (digest) {
+          diagnosticData.gitops_managed = true;
+          diagnosticData.gitops_desired_state = digest;
         }
       }
 
@@ -309,21 +284,11 @@ class DiagnosticsEngine {
         }
       }
 
-      // 3.5 GitOps previews (best-effort, single clone for the whole batch —
-      // never fails the scan; absent entirely when gitops isn't configured).
-      if (this.config?.gitops && this.config.gitops.enabled !== false && actions.length) {
-        try {
-          const previews = await gitops.computePreviews(this.config.gitops, actions);
-          actions.forEach((action, i) => {
-            action.gitops_preview = previews[i];
-          });
-        } catch (err) {
-          // Defensive: computePreviews() never throws by design, but redact
-          // anyway — nothing derived from a gitops config may be logged
-          // unredacted. Never fails the scan either way.
-          console.error("[Doctor] GitOps preview computation failed:", gitops.redact(err.message, this.config.gitops.pat));
-        }
-      }
+      // NOTE: gitops_preview used to be computed here (a clone per scan with
+      // the customer's PAT). The SERVER computes it now, right after this
+      // report is stored, and writes it onto the action rows — it holds the
+      // credential and the preview is read by the human who approves the
+      // action, so it must not be agent-supplied.
 
       // 4. Push report to server
       await this.pushReport({
@@ -603,9 +568,10 @@ class DiagnosticsEngine {
           undefined,
           { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
         );
-        const result = { action: "deployment_scaled", deployment: name, namespace: ns, replicas };
-        await this._applyGitopsEdit(result, action);
-        return result;
+        // The matching repo edit (if the cluster has a GitOps repo attached)
+        // is made by the SERVER when it receives this result — see
+        // moniple-server gitops.service.applyApprovedActionEdit.
+        return { action: "deployment_scaled", deployment: name, namespace: ns, replicas };
       }
 
       case "delete_pod": {
@@ -692,7 +658,6 @@ class DiagnosticsEngine {
           request: params.request,
           limit: params.limit,
         };
-        await this._applyGitopsEdit(result, action);
         return result;
       }
 
@@ -760,7 +725,6 @@ class DiagnosticsEngine {
           newSize,
           note: "Filesystem resize completes automatically; some provisioners require a pod restart to finish the resize.",
         };
-        await this._applyGitopsEdit(result, action);
         return result;
       }
 
@@ -793,18 +757,21 @@ class DiagnosticsEngine {
             { headers: { "Content-Type": "application/strategic-merge-patch+json" } }
           );
           const previousRev = previousRS.metadata.annotations?.['deployment.kubernetes.io/revision'] || 'unknown';
-          const result = { action: "deployment_rolled_back", deployment: name, namespace: ns, revision: previousRev };
-
-          // The repo edit needs the concrete previous-revision image, which is
-          // only known here (from live ReplicaSet history). If the previous
-          // template has more than one container we can't tell which one the
-          // caller meant to roll back — never guess; skip the repo edit (the
-          // live rollback above already happened) with a clear note.
+          // The SERVER makes the matching repo edit, but the concrete
+          // previous-revision image is only knowable HERE (from live
+          // ReplicaSet history), so report it. More than one container in the
+          // previous template means we cannot tell which image the caller
+          // meant — report null rather than guess; the server then skips the
+          // repo edit and says so (the live rollback already happened).
           const previousContainers = previousRS.spec?.template?.spec?.containers || [];
           const resolvedImage = previousContainers.length === 1 ? previousContainers[0].image : null;
-          await this._applyGitopsEdit(result, action, { resolvedImage });
-
-          return result;
+          return {
+            action: "deployment_rolled_back",
+            deployment: name,
+            namespace: ns,
+            revision: previousRev,
+            resolved_image: resolvedImage,
+          };
         } catch (rollbackErr) {
           return { success: false, message: `Rollback failed: ${rollbackErr.message}` };
         }
@@ -880,21 +847,10 @@ class DiagnosticsEngine {
     }
   }
 
-  // --- Best-effort GitOps repo edit (spec-changing actions only) ---
-  //
-  // Called at the end of each ELIGIBLE case in executeAction, after the live
-  // patch has already succeeded. A git failure here NEVER affects the
-  // already-applied live fix — it is only ever recorded on result.gitops so
-  // it can be surfaced in execution_result. The PAT is never allowed to
-  // leave gitops.js unredacted.
-  async _applyGitopsEdit(result, action, opts = {}) {
-    if (!this.config?.gitops) return;
-    try {
-      result.gitops = await gitops.applyEdit(this.config.gitops, action, opts);
-    } catch (err) {
-      result.gitops = { error: gitops.redact(err.message, this.config.gitops.pat) };
-    }
-  }
+  // NOTE: the GitOps repo edit that used to run here (_applyGitopsEdit ->
+  // gitops.applyEdit with the customer's PAT) is gone. The server performs
+  // it when this action's result is reported, and writes the outcome to the
+  // same `execution_result.gitops` field the app already renders.
 
   // --- Report action execution result ---
 
