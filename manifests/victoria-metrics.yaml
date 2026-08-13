@@ -166,6 +166,10 @@ metadata:
     app: moniple-vmagent
     managed-by: moniple-agent
 rules:
+  # Kubernetes service discovery + kubelet/cAdvisor scraping. Cluster-wide
+  # `configmaps: get` (present in the stock Prometheus role) is deliberately
+  # absent: vmagent reads its scrape config from a mounted ConfigMap volume,
+  # which the kubelet resolves — vmagent itself never calls the API for it.
   - apiGroups: [""]
     resources:
       - nodes
@@ -175,10 +179,6 @@ rules:
       - endpoints
       - pods
     verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources:
-      - configmaps
-    verbs: ["get"]
   - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
     verbs: ["get"]
 ---

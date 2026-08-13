@@ -1,28 +1,26 @@
 # =============================================================================
-# moniple-agent MINIMAL RBAC (least-privilege variant)
+# moniple-agent READ-ONLY RBAC (no install, no remediation)
 # =============================================================================
 # WHEN TO USE THIS:
 #   Use this manifest INSTEAD OF `moniple-agent-rbac.yaml` when you run the
-#   agent with AUTO_INSTALL_MONITORING=false and you pre-install the monitoring
+#   agent with AUTO_INSTALL_MONITORING=false, you pre-install the monitoring
 #   stack (VictoriaMetrics/vmagent + kube-state-metrics + node-exporter) and
-#   their RBAC yourself.
+#   its RBAC yourself, AND you never want the agent to change anything.
 #
-# WHAT IT GRANTS:
-#   Read-only (get/list/watch) access to the cluster objects the agent needs to
-#   collect and summarize metrics. Nothing more.
+# HOW IT DIFFERS FROM THE DEFAULT (`moniple-agent-rbac.yaml`):
+#   The default manifest is ALSO least-privilege — no cluster-wide secrets, no
+#   RBAC write, no cluster-wide workload create. It additionally grants
+#     (a) a namespaced Role for installing the monitoring stack, and
+#     (b) five cluster-wide remediation verbs (delete pods, patch nodes/PVCs/
+#         deployments, delete jobs) used ONLY by Doctor actions you approve.
+#   This variant drops both: every rule below is get/list/watch.
 #
-# WHAT IT DELIBERATELY DOES NOT GRANT (vs. the full variant):
-#   - NO secrets access (the full variant needs it to reconcile monitoring
-#     secrets during auto-install).
-#   - NO create/update/patch/delete on any resource.
-#   - NO rbac.authorization.k8s.io (no ClusterRole/ClusterRoleBinding/Role
-#     management) — so it cannot bootstrap KSM RBAC and is immune to the
-#     GKE/EKS/AKS escalation-protection requirement.
-#
-# Because it grants no write and no RBAC management, this variant CANNOT
-# auto-install monitoring. If you apply this manifest while
-# AUTO_INSTALL_MONITORING is still true (the default), auto-install will fail
-# with permission errors — set AUTO_INSTALL_MONITORING=false.
+# CONSEQUENCES (both are visible in the agent log, neither crashes it):
+#   - Auto-install fails with permission errors → keep
+#     AUTO_INSTALL_MONITORING=false and PROMETHEUS_API_URL pointed at your
+#     own stack.
+#   - Approved Doctor remediation actions fail with a permission error and are
+#     reported back to the app as failed executions.
 # =============================================================================
 ---
 apiVersion: v1
@@ -44,24 +42,22 @@ metadata:
     managed-by: moniple-agent
     variant: minimal
 rules:
-  # Core resources - read-only for metric collection
+  # Core resources — read-only for metric collection + Doctor diagnostics
   - apiGroups: [""]
     resources:
-      - pods
-      - nodes
       - namespaces
-      - services
+      - nodes
+      - pods
+      # Doctor reads the last log lines of crashing pods to explain failures.
+      - pods/log
       - persistentvolumeclaims
-      - configmaps
       - events
     verbs: ["get", "list", "watch"]
-  # Node metric/proxy subresources - read-only (some metric reads need these)
-  - apiGroups: [""]
-    resources:
-      - nodes/metrics
-      - nodes/proxy
+  # events also live under events.k8s.io on modern clusters
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
     verbs: ["get", "list", "watch"]
-  # Apps resources - read-only for workload summaries
+  # Apps resources — read-only for workload summaries
   - apiGroups: ["apps"]
     resources:
       - deployments
@@ -69,9 +65,27 @@ rules:
       - replicasets
       - statefulsets
     verbs: ["get", "list", "watch"]
-  # Metrics endpoints (read-only, for scraping if the agent reads them directly)
-  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
-    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+  # StorageClass read: the PVC checks report whether a volume is expandable.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  # Read-only view of RBAC policy objects, so the agent can report whether the
+  # monitoring stack's ClusterRoles exist. Exposes no credential.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterroles
+      - clusterrolebindings
+    verbs: ["get", "list", "watch"]
+  # Lets the agent ask the API server what it may do instead of finding out
+  # through 403s (it then skips the write paths quietly).
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

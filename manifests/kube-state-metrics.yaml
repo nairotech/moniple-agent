@@ -15,85 +15,29 @@ metadata:
   labels:
     app: moniple-kube-state-metrics
     managed-by: moniple-agent
+# Scoped to exactly the objects Moniple reads. Every PromQL query in the
+# agent (lib/queries.js) and the server uses only:
+#   kube_namespace_status_phase, kube_node_info, kube_node_status_allocatable,
+#   kube_pod_info/_owner/_status_phase/_container_status_restarts_total/
+#   _container_status_waiting_reason, kube_persistentvolumeclaim_info/
+#   _resource_requests_storage_bytes, kube_replicaset_owner.
+# The Deployment below is started with a matching --resources flag, so KSM
+# does not try to watch anything this role withholds.
+# The default kube-state-metrics role includes cluster-wide `secrets: list`,
+# which is cluster-admin-equivalent (ServiceAccount tokens are Secrets) — it
+# is deliberately absent. Do not re-add a resource here without also adding it
+# to --resources AND actually querying it.
 rules:
   - apiGroups: [""]
     resources:
-      - configmaps
-      - secrets
+      - namespaces
       - nodes
       - pods
-      - services
-      - serviceaccounts
-      - resourcequotas
-      - replicationcontrollers
-      - limitranges
       - persistentvolumeclaims
-      - persistentvolumes
-      - namespaces
-      - endpoints
     verbs: ["list", "watch"]
   - apiGroups: ["apps"]
     resources:
-      - statefulsets
-      - daemonsets
-      - deployments
       - replicasets
-    verbs: ["list", "watch"]
-  - apiGroups: ["batch"]
-    resources:
-      - cronjobs
-      - jobs
-    verbs: ["list", "watch"]
-  - apiGroups: ["autoscaling"]
-    resources:
-      - horizontalpodautoscalers
-    verbs: ["list", "watch"]
-  - apiGroups: ["authentication.k8s.io"]
-    resources:
-      - tokenreviews
-    verbs: ["create"]
-  - apiGroups: ["authorization.k8s.io"]
-    resources:
-      - subjectaccessreviews
-    verbs: ["create"]
-  - apiGroups: ["policy"]
-    resources:
-      - poddisruptionbudgets
-    verbs: ["list", "watch"]
-  - apiGroups: ["certificates.k8s.io"]
-    resources:
-      - certificatesigningrequests
-    verbs: ["list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources:
-      - endpointslices
-    verbs: ["list", "watch"]
-  - apiGroups: ["storage.k8s.io"]
-    resources:
-      - storageclasses
-      - volumeattachments
-    verbs: ["list", "watch"]
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources:
-      - mutatingwebhookconfigurations
-      - validatingwebhookconfigurations
-    verbs: ["list", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources:
-      - networkpolicies
-      - ingressclasses
-      - ingresses
-    verbs: ["list", "watch"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources:
-      - leases
-    verbs: ["list", "watch"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources:
-      - clusterrolebindings
-      - clusterroles
-      - rolebindings
-      - roles
     verbs: ["list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -134,6 +78,11 @@ spec:
       containers:
         - name: kube-state-metrics
           image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.10.1
+          args:
+            # Must stay in sync with the ClusterRole above: KSM logs a
+            # permission error for every collector it cannot watch, so the
+            # resource list and the RBAC rules are one contract.
+            - --resources=namespaces,nodes,persistentvolumeclaims,pods,replicasets
           ports:
             - containerPort: 8080
               name: http-metrics

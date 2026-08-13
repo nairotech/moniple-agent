@@ -1,26 +1,29 @@
 # =============================================================================
-# moniple-agent FULL RBAC (auto-install variant)
+# moniple-agent RBAC (least privilege)
 # =============================================================================
-# WARNING: This ClusterRole is effectively CLUSTER-ADMIN-EQUIVALENT. It grants
-# cluster-wide write on `secrets` and full management of
-# `clusterroles`/`clusterrolebindings`. This breadth is REQUIRED ONLY when the
-# agent runs with AUTO_INSTALL_MONITORING=true (the default), because the agent:
+# This is the reference copy of what the Moniple install manifest
+# (`GET https://server.moniple.com/install/agent.yaml?key=mk_...`) applies —
+# keep the two IN SYNC. The install manifest is applied WITH THE OPERATOR'S
+# CREDENTIALS, which is what lets the agent itself stay narrow:
 #
-#   (a) bootstraps the kube-state-metrics RBAC during auto-install — it must
-#       create the KSM ServiceAccount, ClusterRole and ClusterRoleBinding, and
-#       reconcile Secrets/ConfigMaps for the monitoring stack; and
-#   (b) satisfies managed-Kubernetes RBAC-escalation protection (GKE/EKS/AKS):
-#       a subject can only GRANT permissions it ALREADY HOLDS. So to create the
-#       KSM ClusterRole (which needs broad list/watch across many API groups),
-#       the agent's own ClusterRole must itself hold every one of those grants —
-#       otherwise the API server rejects the creation with a 403 escalation
-#       error.
+#   * NO cluster-wide `secrets`. That single grant is cluster-admin-equivalent
+#     (every ServiceAccount token in the cluster is a Secret). The installer's
+#     Secret access is namespaced to the install namespace via the Role below.
+#   * NO write on rbac.authorization.k8s.io. The monitoring stack's RBAC
+#     (kube-state-metrics, vmagent) ships in the install manifest and is
+#     created by the operator, so managed-Kubernetes escalation protection
+#     (GKE/EKS/AKS: "a subject may only grant what it already holds") is
+#     satisfied without the agent holding those permissions.
+#   * NO cluster-wide create/update on workloads. The installer writes only in
+#     the install namespace (Role below). The only cluster-wide writes are the
+#     Doctor remediation verbs, and they run exclusively on actions a user
+#     approves in the app.
 #
-# If you pre-install your monitoring stack yourself and set
-# AUTO_INSTALL_MONITORING=false, prefer the least-privilege variant in
-# `moniple-agent-rbac-minimal.yaml` instead (read-only, no secrets, no RBAC
-# write). Do NOT narrow the rules below while auto-install is enabled — doing so
-# breaks installs on managed clusters via the escalation protection above.
+# HISTORY: before 2026-08-13 this ClusterRole granted cluster-wide `secrets`
+# plus full RBAC management, and the agent re-applied it to itself on every
+# start ("self-heal") — meaning an image update could widen its own privileges
+# without the operator's consent. Both are gone. Missing permissions are now
+# reported in the agent log with an instruction to re-apply the install YAML.
 # =============================================================================
 ---
 apiVersion: v1
@@ -40,119 +43,72 @@ metadata:
     app: moniple-agent
     managed-by: moniple-agent
 rules:
-  # Core resources - agent install + kube-state-metrics delegation
+  # --- Read: metric collection + Doctor diagnostics ---
   - apiGroups: [""]
     resources:
       - namespaces
       - nodes
-      - nodes/proxy
-      - nodes/metrics
       - pods
-      - services
-      - endpoints
-      - serviceaccounts
-      - configmaps
-      # secrets (cluster-wide write): needed to create/reconcile the monitoring
-      # stack's secrets during auto-install. This is the single most sensitive
-      # grant here — drop it (use the minimal variant) if you pre-install
-      # monitoring yourself.
-      - secrets
+      # Doctor reads the last log lines of crashing pods to explain failures.
+      - pods/log
       - persistentvolumeclaims
-      - persistentvolumes
-      - resourcequotas
-      - replicationcontrollers
-      - limitranges
       # Doctor reads cluster events (core API) to explain pod failures /
       # scheduling issues. Without this the events check 403s.
       - events
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "list", "watch"]
   # events also live under events.k8s.io on modern clusters — read there too.
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["get", "list", "watch"]
-  # Apps resources
   - apiGroups: ["apps"]
     resources:
       - deployments
       - daemonsets
       - replicasets
       - statefulsets
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
-  # Batch resources (kube-state-metrics needs)
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources:
-      - cronjobs
       - jobs
-    verbs: ["list", "watch"]
-  # Autoscaling (kube-state-metrics needs)
-  - apiGroups: ["autoscaling"]
-    resources:
-      - horizontalpodautoscalers
-    verbs: ["list", "watch"]
-  # Auth (kube-state-metrics needs)
-  - apiGroups: ["authentication.k8s.io"]
-    resources:
-      - tokenreviews
-    verbs: ["create"]
-  - apiGroups: ["authorization.k8s.io"]
-    resources:
-      - subjectaccessreviews
-    verbs: ["create"]
-  # Policy (kube-state-metrics needs)
-  - apiGroups: ["policy"]
-    resources:
-      - poddisruptionbudgets
-    verbs: ["list", "watch"]
-  # Certificates (kube-state-metrics needs)
-  - apiGroups: ["certificates.k8s.io"]
-    resources:
-      - certificatesigningrequests
-    verbs: ["list", "watch"]
-  # Discovery (kube-state-metrics needs)
-  - apiGroups: ["discovery.k8s.io"]
-    resources:
-      - endpointslices
-    verbs: ["list", "watch"]
-  # Storage (kube-state-metrics needs)
-  - apiGroups: ["storage.k8s.io"]
-    resources:
-      - storageclasses
-      - volumeattachments
+      - cronjobs
     verbs: ["get", "list", "watch"]
-  # Admission (kube-state-metrics needs)
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources:
-      - mutatingwebhookconfigurations
-      - validatingwebhookconfigurations
-    verbs: ["list", "watch"]
-  # Networking (kube-state-metrics needs)
-  - apiGroups: ["networking.k8s.io"]
-    resources:
-      - networkpolicies
-      - ingressclasses
-      - ingresses
-    verbs: ["list", "watch"]
-  # Coordination (kube-state-metrics needs)
-  - apiGroups: ["coordination.k8s.io"]
-    resources:
-      - leases
-    verbs: ["list", "watch"]
-  # RBAC management - agent creates roles for kube-state-metrics and vmagent.
-  # Required for auto-install: the agent provisions the KSM/vmagent
-  # ClusterRoles + bindings. Combined with the broad grants above, this also
-  # satisfies GKE/EKS/AKS escalation protection (the agent can only grant what
-  # it already holds). Remove this rule only with AUTO_INSTALL_MONITORING=false
-  # (see moniple-agent-rbac-minimal.yaml).
+  # StorageClass read: the expand_pvc action must check allowVolumeExpansion
+  # before it patches a PVC.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  # Read-only view of RBAC policy objects: the agent checks whether the
+  # monitoring stack's ClusterRoles exist so it can tell the operator to
+  # re-apply the install manifest. Reading a policy object exposes no
+  # credential and grants no privilege.
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources:
       - clusterroles
       - clusterrolebindings
-      - roles
-      - rolebindings
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Metrics endpoints (vmagent scraping)
-  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
+  # The agent asks the API server what it may do (SelfSubjectAccessReview)
+  # instead of discovering its own permissions through 403 errors.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews"]
+    verbs: ["create"]
+  # --- Write: ONLY the Doctor remediation actions a user approves in the app.
+  # Delete the five rules below for a strictly read-only agent; approved
+  # remediation then fails with a permission error and nothing else changes.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -164,6 +120,51 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: moniple-agent
+subjects:
+  - kind: ServiceAccount
+    name: moniple-agent
+    namespace: moniple
+---
+# Installer permissions, scoped to the install namespace only. The agent
+# creates the monitoring stack (VictoriaMetrics, vmagent, kube-state-metrics,
+# node-exporter) here and nowhere else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: moniple-agent
+  namespace: moniple
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+rules:
+  - apiGroups: [""]
+    resources:
+      - serviceaccounts
+      - configmaps
+      - services
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Secrets: install namespace ONLY, and only the verbs the installer uses.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: moniple-agent
+  namespace: moniple
+  labels:
+    app: moniple-agent
+    managed-by: moniple-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: moniple-agent
 subjects:
   - kind: ServiceAccount
